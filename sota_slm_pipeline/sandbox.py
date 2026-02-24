@@ -71,47 +71,43 @@ def is_safe_code(code_string):
         return False, f"AST Parse Error: {e}"
 
 
-def run_code_in_sandbox(code_string, timeout=2.0) -> int:
+def run_code_in_sandbox(code_string, timeout=2.0):
     """
     Führt den Code stark limitiert (hinsichtlich Zeit und Built-ins) aus.
-    WARNUNG GIBT: Gibt den Reward Score (0.0 bis 2.0) basierend auf dem Ausgang zurück.
-    
-    Ideal wäre eine echte Docker-Isolation pro Prozess (`docker run ...`), 
-    aber für GRPO-Training auf Single-Node ist Subprocess mit AST-Guard 
-    und Restriktionen der performanteste Mittelweg.
+    Gibt ein Tuple (Reward Score, Execution Time) zurück.
+    Das ermöglicht "Dense Rewards" abhängig von Laufzeiteffizienz.
     """
     
     # 1. AST Sicherheitsprüfung (Verhindert Reward-Hacking & Systemmanipulation)
     is_safe, error_msg = is_safe_code(code_string)
     if not is_safe:
-        # Code war gefährlich (sys, os) oder syntaktisch kaputt.
         if "Syntax Error" in error_msg:
-             return 0.0 # Syntax kaputt
+             return 0.0, 0.0 # Dense Reward: 0.0, Code ist unleserlich
         else:
-             return -1.0 # Absichtlicher Cheat / Reward-Hacking Versuch formuliert
+             return -1.0, 0.0 # Cheat / Hack-Versuch
 
     # 2. Physikalische Ausführung im isolierten Subprozess
+    import time
+    start_time = time.time()
     try:
-        # Wir übergeben den Python-Interpreter explizit, reduzieren aber 
-        # Berechtigungen (so gut es auf OS-Ebene simpel möglich ist).
-        # Die timeout Limitierung verhindert Endlosschleifen (while True).
         result = subprocess.run(
             [sys.executable, "-c", code_string],
             capture_output=True,
             text=True,
             timeout=timeout,
         )
+        exec_time = time.time() - start_time
         
-        # 3. Auswertung des Exit-Codes
+        # 3. Dense Reward Zuweisung basierend auf Ausbeute
         if result.returncode == 0:
-            return 2.0 # Perfekte Ausführung, Tests passed.
+            return 2.0, exec_time # Perfekte Ausführung
         elif "AssertionError" in result.stderr:
-            return 0.5 # Logikfehler: Test failed, aber syntaktisch und per se lauffähig.
+            return 0.5, exec_time # Dense Reward: AST war okay, lief los, aber Logik-Fehler in Edge-Cases
         else:
-            return 0.1 # Anderer Laufzeitfehler (TypeError, NameError, etc.)
+            return 0.1, exec_time # Dense Reward: Konnte starten, brach aber wegen Runtime-Error ab
             
     except subprocess.TimeoutExpired:
-        return -0.5 # Endlosschleife oder extrem ineffiziente Laufzeit (Time-Limit Exceeded)
+        return -0.5, timeout # Dense Penalty: O(n^2) endlose Laufzeit
     except Exception as e:
         print(f"Sandbox fatal error: {e}")
-        return 0.0
+        return 0.0, 0.0

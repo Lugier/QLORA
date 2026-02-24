@@ -79,7 +79,6 @@ def execution_reward_func(prompts: List[str], completions: List[Dict[str, str]],
     rewards = []
     responses = [comp[0]["content"] if isinstance(comp, list) else comp["content"] for comp in completions]
     
-    # ZIP iteriert über die modellgenerierten Antworten und die versteckten Tests (`answer` = test case snippet)
     for resp, expected_tests in zip(responses, answer):
         extracted_code = extract_xml_content(resp, "answer")
         
@@ -95,9 +94,23 @@ def execution_reward_func(prompts: List[str], completions: List[Dict[str, str]],
         full_eval_code = f"{code_snippet}\n\n# --- Unit Tests ---\n{expected_tests}"
         
         # Sicherheitsgarantierte Ausführung
-        # run_code_in_sandbox gibt direkt unseren float-Reward zurück:
-        # 2.0 (Perfekt), 0.5 (Failed Assert Logik Error), 0.1 (Runtime Error), -0.5 (Timeout), -1.0 (Hack Versuch)
-        score = run_code_in_sandbox(full_eval_code, timeout=2.0)
-        rewards.append(score)
+        # run_code_in_sandbox gibt direkt unseren float-Reward und die Exec-Time zurück
+        base_score, exec_time = run_code_in_sandbox(full_eval_code, timeout=2.0)
+        
+        # Gestaffeltes Reward-Shaping (Dense Rewards) basierend auf Ausführungszeit
+        final_score = base_score
+        
+        # Wenn der Code erfolgreich war, belohnen wir Effizienz
+        if base_score == 2.0:
+            if exec_time < 0.05:
+                final_score += 0.5 # Exzellente O(1) oder O(n) Lösung
+            elif exec_time > 0.5:
+                final_score -= 0.5 # Funktionierender Code, aber ineffizient O(n^2) etc.
+                
+        # Wenn er überhaupt AST-parsable war, geben wir wenigstens minimalen Base-Float für Gradienten
+        if base_score == 0.1: 
+            final_score += 0.1
+            
+        rewards.append(final_score)
         
     return rewards

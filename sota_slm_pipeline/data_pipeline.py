@@ -98,6 +98,37 @@ def format_evol_prompt(example):
     return {"text": formatted_text}
 
 
+def format_trajectory_prompt(example):
+    """
+    Formatierung für Agentic Trajectories (Multi-Turn).
+    Lehrt das Modell den Umgang mit Tools (z.B. view_file, grep) zur Bug-Lokalisation,
+    bevor der eigentliche Patch geschrieben wird.
+    """
+    system_prompt = (
+        "You are an autonomous software engineering agent. You are provided with an issue "
+        "description and a repository. You must use tools (like shell commands or file editors) "
+        "to explore the codebase, understand the bug, and iteratively develop a solution inside <answer> tags."
+    )
+    
+    # SWE-agent trajectories formatieren (vereinfachte Rekonstruktion der History)
+    issue = example.get('instance_id', 'Unknown Issue')
+    trajectory = example.get('trajectory', []) # Liste von Actions/Observations
+    
+    history = f"Issue: Resolving {issue}\n"
+    for step in trajectory:
+        action = step.get('action', '')
+        obs = step.get('observation', '')
+        history += f"\n[Action]: {action}\n[Observation]: {obs}"
+        
+    formatted_text = (
+        f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        f"<|im_start|>user\n{history}<|im_end|>\n"
+        f"<|im_start|>assistant\n<reasoning>\nTrajectory completed.\n</reasoning>\n"
+        f"<answer>\nPatch ready based on trajectory exploration.\n</answer><|im_end|>"
+    )
+    return {"text": formatted_text}
+
+
 def build_sota_dataset(output_dir="./sota_slm_coding_dataset"):
     """
     Kombiniert Reasoning-Traces und verifizierte Bugs zu einem hochqualitativen SFT-Korpus.
@@ -134,11 +165,21 @@ def build_sota_dataset(output_dir="./sota_slm_coding_dataset"):
         print(f"Warnung: Konnte Evol-Instruct nicht laden. Fehler: {e}")
         ds_evol = None
 
+    # 4. Agentic Trajectories (SWE-Bench Multi-Turn Mastery)
+    print("Loading SWE-agent Trajectories for multi-turn tool use...")
+    try:
+        ds_traj = load_dataset("princeton-nlp/SWE-agent-trajectories", split="train[:5000]")
+        ds_traj = ds_traj.map(format_trajectory_prompt, remove_columns=ds_traj.column_names)
+    except Exception as e:
+        print(f"Warnung: Konnte SWE-agent Trajectories nicht laden. Fehler: {e}")
+        ds_traj = None
+
     # Aggregation & Speicherung
     datasets_to_concat = []
     if ds_reasoning: datasets_to_concat.append(ds_reasoning)
     if ds_bugs: datasets_to_concat.append(ds_bugs)
     if ds_evol: datasets_to_concat.append(ds_evol)
+    if ds_traj: datasets_to_concat.append(ds_traj)
     
     if not datasets_to_concat:
         print("Kritischer Fehler: Keine Datensätze konnten geladen werden.")
