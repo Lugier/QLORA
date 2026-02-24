@@ -188,6 +188,32 @@ def format_codefeedback_prompt(example):
     return {"text": formatted_text}
 
 
+def format_mcts_prompt(example):
+    """
+    Monte Carlo Tree Search (OpenO1). 
+    Lehrt das Modell, in Hypothesen zu denken, Ideen zu evaluieren und (ganz wichtig)
+    Entscheidungen zu verwerfen ("Backtracking"), bevor es den endgültigen Code schreibt.
+    """
+    system_prompt = (
+        "You are an advanced reasoning agent capable of Monte Carlo Tree Search (MCTS) exploration. "
+        "Before generating the final answer inside <answer> tags, use the <reasoning> tags to:\n"
+        "1. Formulate multiple distinct hypotheses or approaches.\n"
+        "2. Evaluate each approach logically (pros/cons, edge cases).\n"
+        "3. Explicitly verify or reject (backtrack) flawed approaches.\n"
+        "4. Select the most robust approach."
+    )
+    instruction = example.get('instruction', example.get('prompt', ''))
+    solution = example.get('output', example.get('response', ''))
+    
+    formatted_text = (
+        f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        f"<|im_start|>user\n{instruction}<|im_end|>\n"
+        f"<|im_start|>assistant\n<reasoning>\nGenerating reasoning tree. Planning alternatives...\n</reasoning>\n"
+        f"<answer>\n{solution}\n</answer><|im_end|>"
+    )
+    return {"text": formatted_text}
+
+
 def build_sota_dataset(output_dir="./sota_slm_coding_dataset"):
     """
     Kombiniert Reasoning-Traces und verifizierte Bugs zu einem hochqualitativen SFT-Korpus.
@@ -260,6 +286,17 @@ def build_sota_dataset(output_dir="./sota_slm_coding_dataset"):
         print(f"Warnung: Konnte CodeFeedback nicht laden. Fehler: {e}")
         ds_feedback = None
 
+    # 7. MCTS / Deep Exploring (OpenO1-SFT)
+    print("Loading OpenO1-SFT for Monte Carlo Tree Search (MCTS) Backtracking logic...")
+    try:
+        # OpenO1 ist ein hochqualitativer Open-Source Datensatz, der genau diese 
+        # "Ich versuche A -> A klappt nicht -> Ich versuche B -> B klappt" Struktur enthält.
+        ds_mcts = load_dataset("O1-CODER/OpenO1-SFT", split="train[:8000]")
+        ds_mcts = ds_mcts.map(format_mcts_prompt, remove_columns=ds_mcts.column_names)
+    except Exception as e:
+        print(f"Warnung: Konnte MCTS Dataset nicht laden. Fehler: {e}")
+        ds_mcts = None
+
     # Aggregation & Speicherung
     datasets_to_concat = []
     if ds_reasoning: datasets_to_concat.append(ds_reasoning)
@@ -269,6 +306,7 @@ def build_sota_dataset(output_dir="./sota_slm_coding_dataset"):
     if ds_traj: datasets_to_concat.append(ds_traj)
     if ds_math: datasets_to_concat.append(ds_math)
     if ds_feedback: datasets_to_concat.append(ds_feedback)
+    if ds_mcts: datasets_to_concat.append(ds_mcts)
     
     if not datasets_to_concat:
         print("Kritischer Fehler: Keine Datensätze konnten geladen werden.")
