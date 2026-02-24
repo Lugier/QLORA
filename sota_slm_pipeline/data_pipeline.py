@@ -57,6 +57,9 @@ def format_bug_prompt(example):
     instruction = f"Issue Description: {example.get('problem_statement', '')}"
     solution = example.get('patch', '')
     
+    instruction = f"Issue Description: {example.get('problem_statement', '')}"
+    solution = example.get('patch', '')
+    
     # Kurze analytische Struktur simulieren für Konsistenz
     rationale = (
         "Analyzing the provided issue description to isolate the root cause. "
@@ -68,6 +71,29 @@ def format_bug_prompt(example):
         f"<|im_start|>user\n{instruction}<|im_end|>\n"
         f"<|im_start|>assistant\n<reasoning>\n{rationale}\n</reasoning>\n"
         f"<answer>\n{solution}\n</answer><|im_end|>"
+    )
+    return {"text": formatted_text}
+
+
+def format_evol_prompt(example):
+    """
+    Formatierung für komplexe, schrittweise Evol-Instruct Coding Probleme.
+    Fördert massiv die Syntax-Mächtigkeit und Programmier-Tiefe.
+    """
+    system_prompt = (
+        "You are an elite coding assistant. Solve the deeply complex programming "
+        "challenge inside <answer> tags. It is highly recommended to think through "
+        "edge cases in <reasoning> tags first."
+    )
+    instruction = example.get('instruction', '')
+    solution = example.get('output', '')
+    
+    # Da Evol-Instruct keine Traces hat, lassen wir das Modell direkt in den Direct-Mode gehen
+    # oder vergeben Dummy-Traces. Der Wert liegt hier in der Instruktionsverschachtelung.
+    formatted_text = (
+        f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        f"<|im_start|>user\n{instruction}<|im_end|>\n"
+        f"<|im_start|>assistant\n<answer>\n{solution}\n</answer><|im_end|>"
     )
     return {"text": formatted_text}
 
@@ -97,10 +123,22 @@ def build_sota_dataset(output_dir="./sota_slm_coding_dataset"):
         print(f"Warnung: Konnte princeton-nlp/SWE-bench_Lite nicht laden. Fehler: {e}")
         ds_bugs = None
 
-    # 3. Aggregation & Speicherung
+    # 3. Evol-Instruct (Komplexitäts-Skalierung für $20 Budget)
+    print("Loading WizardLM Evol-Instruct for deep structural syntax...")
+    try:
+        ds_evol = load_dataset("WizardLM/WizardLM_evol_instruct_V2_196k", split="train[:25000]")
+        # Filtere leere Zeilen aus
+        ds_evol = ds_evol.filter(lambda x: x['instruction'] is not None and x['output'] is not None)
+        ds_evol = ds_evol.map(format_evol_prompt, remove_columns=ds_evol.column_names)
+    except Exception as e:
+        print(f"Warnung: Konnte Evol-Instruct nicht laden. Fehler: {e}")
+        ds_evol = None
+
+    # Aggregation & Speicherung
     datasets_to_concat = []
     if ds_reasoning: datasets_to_concat.append(ds_reasoning)
     if ds_bugs: datasets_to_concat.append(ds_bugs)
+    if ds_evol: datasets_to_concat.append(ds_evol)
     
     if not datasets_to_concat:
         print("Kritischer Fehler: Keine Datensätze konnten geladen werden.")

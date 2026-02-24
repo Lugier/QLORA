@@ -62,7 +62,7 @@ def train_sft():
             per_device_train_batch_size = 4,
             gradient_accumulation_steps = 4,
             warmup_steps = 100,
-            max_steps = 1500, # Wir trainieren nur 1.500 Schritte als SFT-Warmstart
+            max_steps = 3000, # Skaliert auf 3.000 Schritte (~5 Std auf 4090) für Max-Gain innerhalb 20$ Budget
             learning_rate = 2e-4,
             fp16 = not torch.cuda.is_bfloat16_supported(),
             bf16 = torch.cuda.is_bfloat16_supported(),

@@ -67,7 +67,7 @@ def train_grpo():
         learning_rate = 5e-6, # Sehr konservativ, um KL-Divergenz gering zu halten
         lr_scheduler_type = "cosine",
         logging_steps = 5,
-        max_steps = 400, # Anzahl Optimierungsschritte im RL
+        max_steps = 1500, # Massiv erhöht ($20 Target-Budget) für tiefergehende Kausalitäts-Exploration
         per_device_train_batch_size = 2,
         gradient_accumulation_steps = 4,
         num_generations = 8, # Gruppengröße: 8 divergierende Lösungswege pro Prompt
