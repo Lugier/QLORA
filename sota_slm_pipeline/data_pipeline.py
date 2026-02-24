@@ -214,6 +214,35 @@ def format_mcts_prompt(example):
     return {"text": formatted_text}
 
 
+def format_commitpack_prompt(example):
+    """
+    Multi-File / Long-Context (CommitPackFT).
+    Lehrt das Modell, git-ähnliche Diff-Formate über mehrere Dateien 
+    und Projektkontexte hinweg (Project-Size) zu verstehen und zu generieren.
+    """
+    system_prompt = (
+        "You are an expert software architect. Analyze the provided codebase context "
+        "or issue description, and provide a comprehensive, multi-file git patch "
+        "inside <answer> tags. Outline your architectural strategy in <reasoning> tags first."
+    )
+    
+    # In CommitPackFT heißt der Kontext meist 'old_contents' oder die Message 'message'
+    instruction = f"Commit Message / Issue: {example.get('message', '')}\n\nPre-Commit Context / Code:\n{example.get('old_contents', '')}"
+    solution = f"Git Patch Diff:\n{example.get('diff', '')}"
+    
+    # Truncate to avoid extreme OOMs during SFT (max ~3000 chars context)
+    if len(instruction) > 3000:
+         instruction = instruction[:3000] + "\n...[Context truncated for efficiency]"
+         
+    formatted_text = (
+        f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        f"<|im_start|>user\n{instruction}<|im_end|>\n"
+        f"<|im_start|>assistant\n<reasoning>\nAnalyzing multi-file dependency graph...\n</reasoning>\n"
+        f"<answer>\n{solution}\n</answer><|im_end|>"
+    )
+    return {"text": formatted_text}
+
+
 def build_sota_dataset(output_dir="./sota_slm_coding_dataset"):
     """
     Kombiniert Reasoning-Traces und verifizierte Bugs zu einem hochqualitativen SFT-Korpus.
@@ -297,6 +326,17 @@ def build_sota_dataset(output_dir="./sota_slm_coding_dataset"):
         print(f"Warnung: Konnte MCTS Dataset nicht laden. Fehler: {e}")
         ds_mcts = None
 
+    # 8. Long-Context & Multi-File Healing (CommitPackFT)
+    print("Loading CommitPackFT for Long-Context Multi-File Git Diff reasoning...")
+    try:
+        # Wir laden nur den Python Subset für garantierte Qualität, man kann hier aber 
+        # später auch auf 'all' wechseln, wenn das Modell polyglot werden soll.
+        ds_commit = load_dataset("bigcode/commitpackft", "python", split="train[:5000]")
+        ds_commit = ds_commit.map(format_commitpack_prompt, remove_columns=ds_commit.column_names)
+    except Exception as e:
+        print(f"Warnung: Konnte CommitPackFT nicht laden. Fehler: {e}")
+        ds_commit = None
+
     # Aggregation & Speicherung
     datasets_to_concat = []
     if ds_reasoning: datasets_to_concat.append(ds_reasoning)
@@ -307,6 +347,7 @@ def build_sota_dataset(output_dir="./sota_slm_coding_dataset"):
     if ds_math: datasets_to_concat.append(ds_math)
     if ds_feedback: datasets_to_concat.append(ds_feedback)
     if ds_mcts: datasets_to_concat.append(ds_mcts)
+    if ds_commit: datasets_to_concat.append(ds_commit)
     
     if not datasets_to_concat:
         print("Kritischer Fehler: Keine Datensätze konnten geladen werden.")
