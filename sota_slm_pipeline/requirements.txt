@@ -1,0 +1,22 @@
+# SOTA SLM Pipeline Environment Dependencies
+
+torch==2.4.0
+torchaudio==2.4.0
+torchvision==2.4.0
+xformers
+triton==3.0.0
+
+# Core Training Tools
+unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git
+vllm
+transformers
+trl
+peft
+accelerate
+bitsandbytes
+datasets
+evaluate
+
+# Pipeline Utilities
+pandas
+pynvml
