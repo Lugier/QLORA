@@ -129,6 +129,65 @@ def format_trajectory_prompt(example):
     return {"text": formatted_text}
 
 
+def format_stratos_prompt(example):
+    """
+    SOTA Reasoning Distillation.
+    """
+    system_prompt = (
+        "You are an elite reasoning assistant. Solve the problem inside <answer> tags "
+        "after deep thought in <reasoning> tags."
+    )
+    instruction = example.get('prompt', example.get('messages', str(example)))
+    solution = example.get('response', example.get('generation', ''))
+    
+    formatted_text = (
+        f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        f"<|im_start|>user\n{instruction}<|im_end|>\n"
+        f"<|im_start|>assistant\n<answer>\n{solution}\n</answer><|im_end|>"
+    )
+    return {"text": formatted_text}
+
+
+def format_math_prompt(example):
+    """
+    Mathematische Kausalität (NuminaMath). Zwingt das Modell, Theoreme aufzustellen.
+    """
+    system_prompt = (
+        "You are an elite mathematical reasoning assistant. Solve the math problem "
+        "step-by-step inside <reasoning> tags, then provide the final answer inside <answer> tags."
+    )
+    instruction = example.get('problem', '')
+    solution = example.get('solution', '')
+    
+    formatted_text = (
+        f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        f"<|im_start|>user\n{instruction}<|im_end|>\n"
+        f"<|im_start|>assistant\n<reasoning>\nAnalyzing mathematical structure...\n</reasoning>\n"
+        f"<answer>\n{solution}\n</answer><|im_end|>"
+    )
+    return {"text": formatted_text}
+
+
+def format_codefeedback_prompt(example):
+    """
+    Self-Healing (CodeFeedback). Lehrt das Modell, aus Fehlermeldungen zu lernen.
+    """
+    system_prompt = (
+        "You are an autonomous self-healing coder. Analyze the execution error, "
+        "explain the flaw inside <reasoning> tags, and provide the fixed code inside <answer> tags."
+    )
+    instruction = example.get('query', '')
+    solution = example.get('answer', '')
+    
+    formatted_text = (
+        f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        f"<|im_start|>user\n{instruction}<|im_end|>\n"
+        f"<|im_start|>assistant\n<reasoning>\nAnalyzing compiler/execution error to self-correct...\n</reasoning>\n"
+        f"<answer>\n{solution}\n</answer><|im_end|>"
+    )
+    return {"text": formatted_text}
+
+
 def build_sota_dataset(output_dir="./sota_slm_coding_dataset"):
     """
     Kombiniert Reasoning-Traces und verifizierte Bugs zu einem hochqualitativen SFT-Korpus.
@@ -138,12 +197,21 @@ def build_sota_dataset(output_dir="./sota_slm_coding_dataset"):
     # 1. Distilled Rationales (OpenCodeReasoning)
     print("Loading OpenCodeReasoning subset (focused on high diversity)...")
     try:
-        ds_reasoning = load_dataset("nvidia/OpenCodeReasoning", split="train[:50000]")
+        ds_reasoning = load_dataset("nvidia/OpenCodeReasoning", split="train[:25000]")
         ds_reasoning = ds_reasoning.map(format_reasoning_prompt, remove_columns=ds_reasoning.column_names)
     except Exception as e:
         print(f"Warnung: Konnte nvidia/OpenCodeReasoning nicht laden, nutze Fallback. Fehler: {e}")
         # Dummy oder Fallback für lokale Tests
         ds_reasoning = None
+
+    # 1b. Bespoke Stratos (SOTA Reasoning)
+    print("Loading Bespoke-Stratos for O1-level reasoning...")
+    try:
+        ds_stratos = load_dataset("HuggingFaceH4/Bespoke-Stratos-17k", split="train[:15000]")
+        ds_stratos = ds_stratos.map(format_stratos_prompt, remove_columns=ds_stratos.column_names)
+    except Exception as e:
+        print(f"Warnung: Konnte Stratos nicht laden. Fehler: {e}")
+        ds_stratos = None
 
     # 2. Verified Bugs (SWE-bench Lite)
     print("Loading Verified Bugs for repository-level alignment...")
@@ -174,12 +242,33 @@ def build_sota_dataset(output_dir="./sota_slm_coding_dataset"):
         print(f"Warnung: Konnte SWE-agent Trajectories nicht laden. Fehler: {e}")
         ds_traj = None
 
+    # 5. NuminaMath (CoT Mathematical Logic)
+    print("Loading NuminaMath for hardcore causal logic...")
+    try:
+        ds_math = load_dataset("AI-MO/NuminaMath-CoT", split="train[:10000]")
+        ds_math = ds_math.map(format_math_prompt, remove_columns=ds_math.column_names)
+    except Exception as e:
+        print(f"Warnung: Konnte NuminaMath nicht laden. Fehler: {e}")
+        ds_math = None
+
+    # 6. CodeFeedback (Self-Healing)
+    print("Loading CodeFeedback for compiler error self-healing...")
+    try:
+        ds_feedback = load_dataset("m-a-p/CodeFeedback-Filtered-Instruction", split="train[:10000]")
+        ds_feedback = ds_feedback.map(format_codefeedback_prompt, remove_columns=ds_feedback.column_names)
+    except Exception as e:
+        print(f"Warnung: Konnte CodeFeedback nicht laden. Fehler: {e}")
+        ds_feedback = None
+
     # Aggregation & Speicherung
     datasets_to_concat = []
     if ds_reasoning: datasets_to_concat.append(ds_reasoning)
+    if ds_stratos: datasets_to_concat.append(ds_stratos)
     if ds_bugs: datasets_to_concat.append(ds_bugs)
     if ds_evol: datasets_to_concat.append(ds_evol)
     if ds_traj: datasets_to_concat.append(ds_traj)
+    if ds_math: datasets_to_concat.append(ds_math)
+    if ds_feedback: datasets_to_concat.append(ds_feedback)
     
     if not datasets_to_concat:
         print("Kritischer Fehler: Keine Datensätze konnten geladen werden.")

@@ -1,16 +1,60 @@
 import torch
 import os
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
+from transformers import TrainingArguments, TrainerCallback
+import copy
 from unsloth import FastLanguageModel, PatchFastRL
 from trl import GRPOConfig, GRPOTrainer
 
 # Import der sicheren Reward-Funktionen aus unserem Modul
-from rewards import strict_format_reward_func, length_penalty_reward_func, execution_reward_func
+from rewards import strict_format_reward_func, len_penalty_reward_func, execution_reward_func
+
+# 1. Wir überschreiben vLLM Flags, um FP8 KV-Cache zu nutzen
+# Dies spart massiv VRAM und erlaubt uns, Multi-Turn Chats im RL zu simulieren
+os.environ["VLLM_KV_CACHE_DTYPE"] = "fp8"
 
 # ==============================================================================
-# Phase 2: Alignment via GRPO (Group Relative Policy Optimization)
-# Wendet Reinforcement Learning (RL) an und nutzt vLLM für rapide Generation.
+# Phase 2: GRPO Reinforcement Learning (The Intelligence Phase)
 # ==============================================================================
+
+class EMACheckpointCallback(TrainerCallback):
+    """
+    Production-Grade EMA (Exponential Moving Average) Mechanismus.
+    Glättet die Rewards im Late-Game, indem Gewichte über die Zeit als 
+    Average gespeichert werden, was vor catastrophic forgetting im RL schützt.
+    """
+    def __init__(self, model, max_steps, decay=0.999):
+        self.ema_model_weights = None
+        self.model = model
+        self.decay = decay
+        
+        # Aktivieren erst in den letzten 30% des Trainings (Late-Game Stabilization)
+        self.start_ema_step = int(max_steps * 0.7)
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step < self.start_ema_step:
+            return
+            
+        with torch.no_grad():
+            if self.ema_model_weights is None:
+                # Initialisiere EMA Gewichte beim ersten gültigen Step
+                self.ema_model_weights = {
+                    k: v.clone().detach() 
+                    for k, v in self.model.state_dict().items() if v.requires_grad
+                }
+            else:
+                # Fließender Durchschnitts-Update
+                state_dict = self.model.state_dict()
+                for k in self.ema_model_weights.keys():
+                    self.ema_model_weights[k].mul_(self.decay).add_(
+                        state_dict[k].detach(), alpha=1 - self.decay
+                    )
+
+    def on_train_end(self, args, state, control, **kwargs):
+        # Beim Trainingsende laden wir die robusten EMA-Gewichte zurück ins aktive Modell
+        if self.ema_model_weights is not None:
+            print("\nApplying Exponential Moving Average (EMA) weights for robust production checkpoint...")
+            self.model.load_state_dict(self.ema_model_weights, strict=False)
 
 def format_rl_prompt(example):
     """
@@ -63,7 +107,7 @@ def train_grpo():
     # Achtung VRAM-Gefahr: Wir erzeugen simultan num_generations=8 Antworten. 
     # Das kostet extrem viel Speicher. Daher Batch-Size auf 1 oder 2 limitieren.
     training_args = GRPOConfig(
-        output_dir = "outputs_grpo",
+        weight_decay = 0.1,
         learning_rate = 5e-6, # Sehr konservativ, um KL-Divergenz gering zu halten
         lr_scheduler_type = "cosine",
         logging_steps = 5,
@@ -72,26 +116,29 @@ def train_grpo():
         gradient_accumulation_steps = 4,
         num_generations = 8, # Gruppengröße: 8 divergierende Lösungswege pro Prompt
         max_prompt_length = 512,
-        max_completion_length = 2048, # Maximale Länge für Reasoning + Code
+        max_completion_length = 1500, # Bietet Platz für Multi-Turn Reflexion im Antwort-Token-Space
+        fp16 = not torch.cuda.is_bfloat16_supported(),
         bf16 = True, # Hardware Optimierung auf RTX 4090 / A100
         optim = "adamw_8bit",
         # GRPO-spezifisch: KL-Strafe (verhindert das Abdriften des Modells in kryptische Ausgaben)
         beta = 0.05, 
     )
 
+    # 4. GRPOTrainer initialisieren (Mit AERO Rewards und EMA Callback)
     trainer = GRPOTrainer(
-        model = model,
+        model=model,
         processing_class = tokenizer,
-        reward_funcs = [
-            strict_format_reward_func, # 1. Schritt: Stimmt das Format? (<reasoning> / <answer>)
-            length_penalty_reward_func, # 2. Schritt: Ist es unnatürlich lang? (Spam-Penalty)
-            execution_reward_func      # 3. Schritt: Läuft der Code sicher in der Sandbox?
+        reward_funcs=[
+            strict_format_reward_func, 
+            len_penalty_reward_func, 
+            execution_reward_func
         ],
-        args = training_args,
-        train_dataset = rl_dataset,
+        args=training_args,
+        train_dataset=rl_dataset,
+        callbacks=[EMACheckpointCallback(model, max_steps=training_args.max_steps)]
     )
 
-    print("Commencing GRPO Reinforcement Learning Sequence...")
+    print("Initiating Multi-Turn Optimized GRPO Deep-Reasoning Simulation...")
     trainer.train()
     
     # Finale Modell-Sicherung

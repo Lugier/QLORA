@@ -14,6 +14,28 @@ def extract_xml_content(text: str, tag: str) -> str:
         return match.group(1).strip()
     return ""
 
+# Globaler State für AERO (Adaptive Execution Reward Optimization)
+# Wir tracken den Annäherungsfortschritt im Training
+AERO_GLOBAL_STEP = 0
+AERO_MAX_STEPS = 1500 # Sollte identisch mit max_steps im GRPO Trainer sein
+
+def get_aero_weights():
+    """
+    Berechnet dynamisch die Gewichtung der Rewards (AERO).
+    Am Anfang (Step 0) ist Format-Reward hoch, Execution-Reward niedrig.
+    Am Ende (Step 1500) ist Format-Reward 0, Execution-Reward bekommt einen massiven Multiplikator.
+    """
+    progress = min(1.0, AERO_GLOBAL_STEP / AERO_MAX_STEPS)
+    
+    # Format-Reward fadet von 1.0 (am Anfang) auf 0.1 (am Ende)
+    format_weight = max(0.1, 1.0 - progress)
+    
+    # Execution-Reward skaliert von 1.0 (am Anfang) auf 2.5 (am Ende)
+    exec_weight = 1.0 + (1.5 * progress)
+    
+    return format_weight, exec_weight
+
+
 def strict_format_reward_func(prompts: List[str], completions: List[Dict[str, str]], **kwargs) -> List[float]:
     """
     Belohnt Modelle für das strikte Einhalten der kognitiven Trennung
@@ -22,6 +44,8 @@ def strict_format_reward_func(prompts: List[str], completions: List[Dict[str, st
     """
     rewards = []
     responses = [comp[0]["content"] if isinstance(comp, list) else comp["content"] for comp in completions]
+    
+    format_weight, _ = get_aero_weights() # Get AERO format weight
     
     for resp in responses:
         has_reasoning = "<reasoning>" in resp and "</reasoning>" in resp
@@ -33,9 +57,9 @@ def strict_format_reward_func(prompts: List[str], completions: List[Dict[str, st
             # Voller Format-Reward nur, wenn auch reasoning da ist ODER der Prompt direct-mode verlangte
             # (Da Prompts hier schwer 100% dynamisch greifbar sind, belohnen wir schlichtweg saubere Tags).
             if has_reasoning:
-                rewards.append(1.0)
+                rewards.append(1.0 * format_weight) # Apply AERO scaling
             else:
-                rewards.append(base_reward)
+                rewards.append(base_reward * format_weight) # Apply AERO scaling
         else:
             # Harte Strafe, wenn die Antwort komplett das Format bricht 
             # (und dadurch die Auswertung für execution failed)
@@ -76,6 +100,10 @@ def execution_reward_func(prompts: List[str], completions: List[Dict[str, str]],
     und führt ihn sicher über den AST-Sandbox-Interpreter aus.
     Erzeugt ein starkes, unbestechliches Gradientensignal zur Code-Korrektheit.
     """
+    global AERO_GLOBAL_STEP
+    AERO_GLOBAL_STEP += 1 # Inkrement beim Aufruf der Sandbox (pro Batch)
+    
+    _, exec_weight = get_aero_weights() # Get AERO execution weight
     rewards = []
     responses = [comp[0]["content"] if isinstance(comp, list) else comp["content"] for comp in completions]
     
@@ -111,6 +139,7 @@ def execution_reward_func(prompts: List[str], completions: List[Dict[str, str]],
         if base_score == 0.1: 
             final_score += 0.1
             
-        rewards.append(final_score)
+        # AERO Multiplikator anwenden (Execution wird im Late-Game massiv gepusht)
+        rewards.append(final_score * exec_weight)
         
     return rewards
