@@ -7,7 +7,7 @@ from unsloth import FastLanguageModel, PatchFastRL
 from trl import GRPOConfig, GRPOTrainer
 
 # Import der sicheren Reward-Funktionen aus unserem Modul
-from rewards import strict_format_reward_func, len_penalty_reward_func, execution_reward_func
+from rewards import strict_format_reward_func, length_penalty_reward_func, execution_reward_func, self_verification_reward_func
 
 # 1. Wir überschreiben vLLM Flags, um FP8 KV-Cache zu nutzen
 # Dies spart massiv VRAM und erlaubt uns, Multi-Turn Chats im RL zu simulieren
@@ -97,14 +97,26 @@ def train_grpo():
          print(f"Loading learned SFT structural formats from '{sft_adapter_path}'...")
          model.load_adapter(sft_adapter_path)
     
-    # Für das Execution-Reward-Alignment nutzen wir hier stellvertretend The MBPP (sanitized)
-    # in der echten Pipeline würde hier ein Mix aus MBPP, HumanEval+ und Leetcode Datensätzen genutzt.
-    print("Loading continuous RL environment datasets (MBPP examples)...")
-    eval_dataset = load_dataset("mbpp", "sanitized", split="train[:500]")
-    rl_dataset = eval_dataset.map(format_rl_prompt)
-
-    # GRPO Konfiguration
-    # Achtung VRAM-Gefahr: Wir erzeugen simultan num_generations=8 Antworten. 
+    # Für das Execution-Reward-Alignment nutzen wir    # Datensatz laden und formattieren
+    dataset_path = "./sota_best_of_n_dataset" # Basiert auf Destillations-Phase
+    if not os.path.exists(dataset_path):
+        dataset_path = "./sota_slm_coding_dataset" # Fallback auf SFT Dataset
+        
+    raw_dataset = load_from_disk(dataset_path)
+    # Entfernt evtl. leere Instruktionen/Lösungen für RL
+    raw_dataset = raw_dataset.filter(lambda x: len(x.get('text', '')) > 50) 
+    
+    rl_dataset = raw_dataset.map(format_rl_prompt, remove_columns=raw_dataset.column_names)
+    
+    # === Curriculum Learning (SOTA Optimization) ===
+    # Wir sortieren den Datensatz aufsteigend nach der Länge (Komplexitäts-Proxy) des Prompts.
+    # Dadurch sieht das Modell in den frühen GRPO-Schritten leichtere Aufgaben und stabilisiert
+    # seine Reward-Map, bevor es an harte SWE-Probleme geht.
+    print("Applying Curriculum Learning: Sorting dataset by complexity (prompt length)...")
+    rl_dataset = rl_dataset.map(lambda x: {"prompt_length": len(x["prompt"])})
+    rl_dataset = rl_dataset.sort("prompt_length")
+    
+    # 3. GRPOTrainer Configuration für Max-Reasoning VRAM-Gefahr: Wir erzeugen simultan num_generations=8 Antworten. 
     # Das kostet extrem viel Speicher. Daher Batch-Size auf 1 oder 2 limitieren.
     training_args = GRPOConfig(
         weight_decay = 0.1,
@@ -124,13 +136,14 @@ def train_grpo():
         beta = 0.05, 
     )
 
-    # 4. GRPOTrainer initialisieren (Mit AERO Rewards und EMA Callback)
+    # 4. GRPOTrainer initialisieren (Mit AERO Rewards, Curriculum und EMA Callback)
     trainer = GRPOTrainer(
         model=model,
         processing_class = tokenizer,
         reward_funcs=[
             strict_format_reward_func, 
-            len_penalty_reward_func, 
+            length_penalty_reward_func, 
+            self_verification_reward_func, # TDD-Proactive Reward
             execution_reward_func
         ],
         args=training_args,

@@ -68,30 +68,61 @@ def strict_format_reward_func(prompts: List[str], completions: List[Dict[str, st
     return rewards
 
 
-def length_penalty_reward_func(prompts: List[str], completions: List[Dict[str, str]], **kwargs) -> List[float]:
+def length_penalty_reward_func(prompts, completions, answer, **kwargs):
     """
-    Verhindert "Overthinking", das bei O1/R1-Modellen eine Token-Verschwendung darstellt.
-    Bestraft exzessiv lange Lösungen für möglicherweise sehr kurze Probleme.
+    Bestraft massiv, wenn das Modell versucht, durch endlose (oft repetitive)
+    "Gedankengänge" den Reward zu hacken oder Token-Limits zu sprengen.
+    Führt zu präzisem, effizientem Denken.
     """
     rewards = []
     responses = [comp[0]["content"] if isinstance(comp, list) else comp["content"] for comp in completions]
     
-    # Toleranzschwelle. Lösungen unter 1500 Zeichen werden nicht bestraft.
-    MAX_EFFICIENT_LENGTH = 1500 
-    
     for resp in responses:
-        length = len(resp)
-        if length > MAX_EFFICIENT_LENGTH:
-            # Je länger, desto größer der Penalty (linear skaliert)
-            penalty = -0.5 * ((length - MAX_EFFICIENT_LENGTH) / 1000)
-            # Cap auf max -1.5, damit es formelle und ausführbare Rewards nicht auslöscht, 
-            # aber deutlich nach unten zieht.
-            rewards.append(max(-1.5, penalty))
+        tokens = len(resp.split()) # Simple Heuristik (reicht für Penalty)
+        
+        # Ab 500 wörtern wird es langsam kritisch für ein einfaches SLM
+        if tokens < 300:
+            rewards.append(0.0) # Perfekt
+        elif tokens < 600:
+            rewards.append(-0.2) # Okay, aber etwas lang
+        elif tokens < 1000:
+            rewards.append(-0.5) # Zu geschwätzig
         else:
-            rewards.append(0.0) # Kein Bonus, nur fehlende Strafe
+            # Massive Strafe für Endlos-Loops oder extreme Geschwätzigkeit
+            penalty = min(-2.0, -0.5 - ((tokens - 1000) * 0.001))
+            rewards.append(penalty)
             
     return rewards
 
+def self_verification_reward_func(prompts, completions, answer, **kwargs):
+    """
+    Self-Verification (TDD-Alignment):
+    Sucht im <reasoning> Block explizit nach proaktiven Testfällen (asserts).
+    Belohnt Modelle, die Probleme durch eigenes Test-Driven-Development validieren.
+    """
+    rewards = []
+    responses = [comp[0]["content"] if isinstance(comp, list) else comp["content"] for comp in completions]
+    
+    for resp in responses:
+        reasoning = extract_xml_content(resp, "reasoning")
+        
+        if not reasoning:
+            rewards.append(0.0)
+            continue
+            
+        # Wir zählen, ob das Modell proaktiv Assertions oder Python-Syntax-Checks
+        # in seine Denkphase einbaut
+        assert_count = reasoning.count("assert ")
+        test_count = reasoning.count("def test_")
+        
+        if assert_count >= 2 or test_count >= 1:
+            rewards.append(0.5) # Exzellentes Agentic Behavior (TDD)
+        elif assert_count == 1:
+            rewards.append(0.2) # Guter Anfang
+        else:
+            rewards.append(0.0) # Kein Self-Verification
+            
+    return rewards
 
 def execution_reward_func(prompts: List[str], completions: List[Dict[str, str]], answer: List[str], **kwargs) -> List[float]:
     """
