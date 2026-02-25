@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+*.pyo
+outputs_*/
+qwen_*/
+sota_*_dataset/
+model_export_*/

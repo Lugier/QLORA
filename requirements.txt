@@ -1,0 +1,10 @@
+# Core project dependencies.
+# Torch + Unsloth are installed in scripts/runpod_setup.sh with explicit CUDA/Torch compatibility.
+
+numpy<2
+datasets==2.21.0
+evaluate==0.4.3
+vllm==0.6.6
+
+pandas==2.2.2
+pynvml==11.5.3

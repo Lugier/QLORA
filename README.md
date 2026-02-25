@@ -1,101 +1,184 @@
-# 🚀 SOTA SLM Pipeline: The Architecture of Reasoning
+# SOTA SLM Pipeline (RunPod-Ready, Fail-Fast)
 
-This repository houses a **State-of-the-Art (SOTA) Small Language Model (SLM) Fine-Tuning Pipeline**, engineered in 2026 to distill high-tier algorithmic reasoning into sub-2-Billion parameter models.
+End-to-end Pipeline fuer ein kleines Coding-LLM auf Basis von `Qwen/Qwen2.5-1.5B-Instruct`:
 
-Leveraging the architectural paradigms of **OpenAI o1** and **DeepSeek-R1**, this codebase transitions classical instruction-tuning toward autonomous, self-correcting agentic behavior. Designed specifically for execution on a $20 compute budget (e.g., standard RTX 4090 environments), it sets a new baseline for local, high-performance coding SLMs.
+1. Datenaufbereitung mit harten Qualitaets-Gates
+2. SFT (LoRA)
+3. Best-of-N Distillation
+4. DPO (Preference Alignment)
+5. GRPO (Execution-rewarded RL)
+6. Eval (Classic + Agentic Self-Debug)
+7. Export (GGUF + merged HF)
 
----
+Alle Stages sind fail-fast ausgelegt (kein stilles Weiterlaufen mit leeren Artefakten).
+Die Setup-Stage prueft explizit `Unsloth`, `TRL` und `GRPOTrainer`, damit spaetere RL-Stages nicht erst zur Laufzeit brechen.
 
-## 🔬 Scientific Foundation & Paradigms
+## Steps 1-7 (Produktiv eingebaut)
 
-The prevailing dogma in scaling laws dictates that massive parameter counts are requisite for deep algorithmic capability. This pipeline challenges that assertion by prioritizing **data density**, **multi-turn tool trajectories**, and **hardware-verifiable execution environments (Dense Rewards)** over raw parameter scale.
+Diese sieben Punkte sind im Code und in den RunPod-Skripten bereits integriert:
 
-We employ a dual-phase training strategy:
-1.  **Phase 1 (SFT + Distillation):** Imitation learning via High-Quality Reasoning Traces.
-2.  **Phase 2 (GRPO - Reinforcement Learning):** Self-Alignment through Execution Feedback.
+1. `pass@k` statt nur `pass@1` in der Classic-Eval (`--pass-k` Default `8`).
+2. Strengere Hidden-Test-Qualitaet vor Distillation/RL (`min_asserts`, `min_lines`, `min_quality_score`).
+3. DPO-Paare mit Score-Gap-Filter (`min_score_gap`, `max_rejected_score`, Assert-Mindestanzahl).
+4. 3-Stage Curriculum in GRPO (`easy -> mid -> hard`) mit robuster Step-Allokation.
+5. Retrieval im Agenten mit BM25-Scoring plus Pfad-/Symbol-Heuristiken.
+6. Self-Debug mit Fehlerklassen-Policy und Early-Stop (`early_stop_patience`).
+7. Multi-Benchmark-Eval (`mbpp` + `humaneval`) fuer realistischere Modellmessung.
 
----
+## Projektstruktur
 
-## 🏗 System Architecture
+- `data_pipeline.py`: Multi-Source Dataset Build, Dedup, Quality Gates
+- `phase1_sft.py`: SFT Training
+- `phase1b_rejection_sampling.py`: Best-of-N + DPO Pair Mining
+- `phase1c_dpo.py`: DPO Training
+- `phase2_grpo.py`: GRPO Training
+- `runtime_agent.py`: Retrieval + iterative Self-Debug Loop
+- `eval_pipeline.py`: Evaluation (Classic oder Agentic)
+- `export.py`: Deployment-Artefakte
+- `scripts/runpod_setup.sh`: RunPod-Setup (CUDA Torch + Abhaengigkeiten)
+- `scripts/runpod_train_full.sh`: Vollstaendige Trainings-Orchestrierung
 
-The pipeline is modularly designed, separating data curation, secure execution, reward formulation, and sequential tuning phases.
+## RunPod Quickstart (empfohlen)
 
-### 1. Data Curation & Distillation (`data_pipeline.py`)
+### 1. GPU-Instanz
 
-A model is only as intelligent as its training corpus. We synthesize a highly diversified dataset:
+- Ubuntu + NVIDIA GPU
+- Empfohlen: mindestens 24 GB VRAM
+- Python 3.10
 
-*   **`nvidia/OpenCodeReasoning` (50k):** Injects detailed "Teacher-Rationales" forcing the model to explicitly delineate its thought process within `<reasoning>` tags before generating `<answer>` blocks.
-*   **`WizardLM/WizardLM_evol_instruct_V2` (25k):** Scales structural syntax and semantic depth via complex, iteratively-evolved programming challenges.
-*   **`princeton-nlp/SWE-bench_Lite` (15k):** Grounds the model in repository-level bug fixing, teaching it to isolate issues from problem statements.
-*   **📡 The Multi-Turn Breakthrough: `SWE-agent-trajectories` (5k)**
-    *   Moves the model from "Zero-Shot Guesser" to "Agentic Developer".
-    *   The model learns to navigate codebases iteratively (e.g., `grep_search`, `view_file`) before writing the final patch.
-
-### 2. Phase 1b: Best-of-N Rejection Sampling (`phase1b_rejection_sampling.py`)
-
-GRPO algorithms frequently suffer from "Reward Collapse" when applied to small models with weak base logic.
-
-*   **The R1 / Distillation Trick:** Before true Reinforcement Learning begins, the model generates $N=16$ divergent solutions per prompt.
-*   These generations are evaluated in a physical sandbox.
-*   Only the 100% flawless trajectories (perfect logic + executing code) are retained to construct an ultra-clean "Distillation Dataset", ensuring a solid foundation for RL phase.
-
-### 3. The Hardware Validator: Secure AST Sandbox (`sandbox.py`)
-
-To prevent the SLM from learning "Reward Hacking" (e.g., deleting test files or injecting malicious payloads to artificially boost scores), a rigorous security layer is implemented:
-*   **Abstract Syntax Tree (AST) Parsing:** Pre-execution verification blocks restricted built-ins (e.g., `eval`, `exec`) and lethal os-level modules.
-*   **Isolation:** Code is executed in a fortified `subprocess` with draconian timeouts.
-
-### 4. Dense Rewards Shaping (`rewards.py`)
-
-Sparse rewards (Pass/Fail) provide insufficient gradient density for 1.5B parameter models. We employ **Dense Reward Shaping** based on computational complexity:
-
-| Outcome | Reward Score | Scientific Rationale |
-| :--- | :--- | :--- |
-| **Flawless $O(1)/O(n)$** | `+2.5` | Perfect logic coupled with optimal algorithmic execution time ($t < 0.05s$). |
-| **Operational $O(n^2)$**| `+1.5` | Logic passes asserts, but execution is inefficient ($t > 0.5s$). |
-| **Logic Failure** | `+0.5` | Code parses and runs, but violates algorithmic assertions. |
-| **Runtime Crash** | `+0.1` | Code is syntaktically parsed but crashes. |
-| **Syntax Error** | `0.0` | Malformed Python structure; unreadable AST. |
-| **Timeout / Infinite Loop** | `-0.5` | Destructive computational inefficiency. |
-| **Reward Hacking** | `-1.0` | Malicious module usage detected via AST. |
-| **Format Violation** | `-1.5` | Failure to respect `<reasoning>` and `<answer>` XML constraints. |
-
-### 5. Training Engine (`phase1_sft.py` & `phase2_grpo.py`)
-
-*   **Unsloth Framework:** Enables rapid iteration by quantizing computations and leveraging FlashAttention-2, allowing advanced SFT and GRPO tuning directly on consumer VRAM (RTX 4090).
-*   **vLLM Integration:** During GRPO (`PatchFastRL`), vLLM blitzes through the generation of 8 simultaneous response candidates for maximal comparative policy optimization.
-*   **Cost Optimization:** The hyperparameters are strictly tuned to maximize validation gains while adhering to a strict $20 RunPod inference budget ceiling (approx. 25-28 hours computation).
-
----
-
-## 🛫 Quick Start / Execution Flow
-
-Assuming a fresh GPU environment with Python 3.10+:
+### 2. Setup
 
 ```bash
-# 1. Install Dependencies
-pip install -r requirements.txt
-
-# 2. Build the Multi-Turn Dataset
-python data_pipeline.py
-
-# 3. Supervised Fine-Tuning (SFT) - The Immitation Phase
-python phase1_sft.py
-
-# 4. Best-of-N Rejection Sampling - The Clean Foundation
-python phase1b_rejection_sampling.py
-
-# 5. Group Relative Policy Optimization (GRPO) - The Intelligence Phase
-python phase2_grpo.py
-
-# 6. Export and Deploy (GGUF / HuggingFace Merge)
-python export.py
+cd /workspace/sota_slm_pipeline
+bash scripts/runpod_setup.sh
 ```
 
----
+Optional fuer gated HuggingFace-Datasets:
 
-## 📈 Future Research Vectors
+```bash
+export HF_TOKEN=hf_xxx
+```
 
-While this pipeline scales the current baseline dramatically, researchers can explore:
-1.  **Process Reward Models (PRMs):** Implementing Monte Carlo Tree Search (MCTS) evaluations at the *token level* to reward intermediate logical backtracking.
-2.  **Inference-Time Scaling:** Allowing the model $N \rightarrow \infty$ generation budgets during deployment to iteratively brute-force complex MBPP benchmarks prior to returning the final output.
+### 3. Voller Lauf
+
+```bash
+bash scripts/runpod_train_full.sh
+```
+
+Das Skript stoppt sofort bei Fehlern und prueft nach jeder Stage, ob die erwarteten Artefakte vorhanden sind.
+
+## Manueller Ablauf (falls du pro Stage steuern willst)
+
+```bash
+# 1) Dataset Build (harter Quality Gate)
+python3 data_pipeline.py \
+  --min-total-samples 20000 \
+  --min-test-coverage 0.08 \
+  --min-prompt-coverage 0.99 \
+  --min-unique-ratio 0.75 \
+  --max-missing-sources 6
+
+# 2) SFT
+python3 phase1_sft.py \
+  --dataset-path ./sota_slm_coding_dataset \
+  --adapter-dir qwen_sft_lora \
+  --merged-model-dir qwen_sft_merged \
+  --output-dir outputs_sft \
+  --max-seq-length 8192 \
+  --max-steps 3000
+
+# 3) Best-of-N + DPO pairs
+python3 phase1b_rejection_sampling.py \
+  --model-path qwen_sft_merged \
+  --dataset-path ./sota_slm_coding_dataset \
+  --output-path ./sota_best_of_n_dataset \
+  --dpo-output-path ./sota_dpo_pairs_dataset \
+  --num-prompts 2000 \
+  --num-samples-per-prompt 16 \
+  --timeout 1.0 \
+  --verifier-rounds 2 \
+  --min-test-asserts 2 \
+  --min-test-lines 3 \
+  --min-test-quality-score 2.5 \
+  --min-perfect 50 \
+  --min-dpo-pairs 50 \
+  --dpo-min-score-gap 1.0 \
+  --dpo-max-rejected-score 0.6 \
+  --min-evaluated-candidates 4
+
+# 4) DPO
+python3 phase1c_dpo.py \
+  --dpo-dataset-path ./sota_dpo_pairs_dataset \
+  --sft-adapter-path qwen_sft_lora \
+  --output-dir outputs_dpo \
+  --output-model-dir qwen_dpo_lora \
+  --max-steps 800 \
+  --min-score-gap 1.0 \
+  --max-rejected-score 0.6 \
+  --min-test-assert-count 2
+
+# 5) GRPO (strict, ohne MBPP-Fallback)
+python3 phase2_grpo.py \
+  --max-seq-length 8192 \
+  --max-steps 1500 \
+  --min-test-asserts 2 \
+  --min-test-lines 3 \
+  --min-test-quality-score 2.5 \
+  --output-model-dir qwen_grpo_final \
+  --output-adapter-dir qwen_grpo_lora \
+  --dataset-paths ./sota_best_of_n_dataset,./sota_slm_coding_dataset
+
+# 6) Eval classic (pass@k + multi-benchmark)
+python3 eval_pipeline.py --model-path qwen_grpo_final --benchmarks mbpp,humaneval --num-samples 100 --pass-k 8 --verifier-rounds 2
+
+# 7) Eval agentic (self-debug + retrieval + verifier)
+python3 eval_pipeline.py --model-path qwen_grpo_final --benchmarks mbpp,humaneval --agentic --num-samples 100 --max-rounds 3 --n-candidates 8 --verifier-rounds 2
+
+# 8) Export
+python3 export.py
+```
+
+## Wichtige Outputs
+
+- `sota_slm_coding_dataset`
+- `qwen_sft_lora`
+- `qwen_sft_merged`
+- `sota_best_of_n_dataset`
+- `sota_dpo_pairs_dataset`
+- `qwen_dpo_lora`
+- `qwen_grpo_final`
+- `qwen_grpo_lora`
+- `model_export_gguf`
+- `model_export_hf`
+
+## Design-Entscheidungen fuer Stabilitaet
+
+1. Keine Dummy-/Placeholder-Zeilen in der Datenformatierung.
+2. Harte Mindestschwellen in Data-Build und Distillation.
+3. Stage-Skripte werfen Fehler statt still `return`.
+4. GRPO faellt standardmaessig nicht automatisch auf MBPP zurueck.
+5. Agentic Eval nutzt echte Test-Feedback-Schleifen statt nur Single-Shot Generation.
+
+## Flow (was passiert wann und warum)
+
+1. `data_pipeline.py` baut den Trainingskorpus und bricht bei schlechter Datenqualitaet hart ab.
+2. `phase1_sft.py` gibt dem Basismodell die Coding-Struktur (Instruction-Following + XML-Ausgabeformat).
+3. `phase1b_rejection_sampling.py` generiert mehrere Kandidaten pro Prompt, laesst sie gegen Hidden Tests laufen und behaelt nur starke Trajektorien; daraus werden auch DPO-Paare erzeugt.
+4. `phase1c_dpo.py` richtet das Modell mit sauberen `chosen > rejected` Praeferenzpaaren feiner aus.
+5. `phase2_grpo.py` optimiert mit Execution-Rewards in einem Curriculum (leichte bis schwere Aufgaben), damit sich Robustheit statt nur Stil verbessert.
+6. `eval_pipeline.py` misst klassisch (`pass@1`, `pass@k`) und agentisch (Self-Debug) auf mehreren Benchmarks.
+7. `export.py` erstellt finale Deployment-Artefakte fuer Inferenz (GGUF/HF merged).
+
+## Troubleshooting
+
+1. `CUDA is required...`
+   - Auf CPU-Instanz gestartet oder Torch ohne CUDA installiert.
+   - Loesung: `bash scripts/runpod_setup.sh` auf GPU-RunPod.
+
+2. `Too few DPO pairs`
+   - SFT-Checkpoint noch zu schwach oder Sampling zu konservativ.
+   - Loesung: `--num-prompts`/`--num-samples-per-prompt` erhoehen.
+
+3. Datenquelle nicht ladbar
+   - HuggingFace Auth oder Netzwerkproblem.
+   - Loesung: `HF_TOKEN` setzen und Zugriff auf die Datasets pruefen.
