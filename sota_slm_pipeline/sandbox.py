@@ -1,8 +1,10 @@
 import ast
-import subprocess
-import signal
-import sys
 import os
+import resource
+import subprocess
+import sys
+import tempfile
+import time
 
 # ==============================================================================
 # SOTA SLM Sandbox & Execution Guard
@@ -16,25 +18,28 @@ class SecureASTVisitor(ast.NodeVisitor):
     
     FORBIDDEN_BUILTINS = {
         'eval', 'exec', 'compile', 'open', '__import__',
-        'getattr', 'setattr', 'delattr', 'globals', 'locals'
+        'getattr', 'setattr', 'delattr', 'globals', 'locals',
+        'input', 'breakpoint'
     }
     
-    FORBIDDEN_IMPORTS = {
-        'os', 'sys', 'subprocess', 'shutil', 'pth', 'socket',
-        'urllib', 'requests', 'ctypes', 'winreg', 'pty', 'builtins'
+    # Positive allowlist to keep the sandbox predictable and block fs/network modules.
+    ALLOWED_IMPORTS = {
+        'math', 'itertools', 'functools', 'collections', 'heapq', 'bisect',
+        're', 'string', 'typing', 'dataclasses', 'statistics', 'fractions',
+        'decimal', 'random', 'json'
     }
 
     def visit_Import(self, node):
         for alias in node.names:
             base_module = alias.name.split('.')[0]
-            if base_module in self.FORBIDDEN_IMPORTS:
+            if base_module not in self.ALLOWED_IMPORTS:
                 raise ValueError(f"Forbidden import detected: {alias.name}")
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node):
         if node.module:
             base_module = node.module.split('.')[0]
-            if base_module in self.FORBIDDEN_IMPORTS:
+            if base_module not in self.ALLOWED_IMPORTS:
                 raise ValueError(f"Forbidden from-import detected: {node.module}")
         self.generic_visit(node)
 
@@ -47,9 +52,15 @@ class SecureASTVisitor(ast.NodeVisitor):
         # Überprüfe auf Methodenaufrufe (z.B. os.system, os.popen)
         if isinstance(node.func, ast.Attribute):
             if isinstance(node.func.value, ast.Name):
-                if node.func.value.id in self.FORBIDDEN_IMPORTS:
+                if node.func.value.id not in self.ALLOWED_IMPORTS:
                      raise ValueError(f"Forbidden module call detected: {node.func.value.id}.{node.func.attr}")
         
+        self.generic_visit(node)
+
+    def visit_Attribute(self, node):
+        # Block dunder-attribute traversal used in many Python sandbox escapes.
+        if node.attr.startswith("__"):
+            raise ValueError(f"Forbidden attribute access detected: {node.attr}")
         self.generic_visit(node)
 
 
@@ -87,27 +98,46 @@ def run_code_in_sandbox(code_string, timeout=2.0):
              return -1.0, 0.0 # Cheat / Hack-Versuch
 
     # 2. Physikalische Ausführung im isolierten Subprozess
-    import time
+    def _limit_process_resources():
+        cpu_seconds = max(1, int(timeout))
+        memory_limit = 512 * 1024 * 1024
+        file_limit = 1 * 1024 * 1024
+        fd_limit = 32
+
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds + 1))
+        resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (file_limit, file_limit))
+        resource.setrlimit(resource.RLIMIT_NOFILE, (fd_limit, fd_limit))
+
+    sandbox_env = {
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONPATH": "",
+    }
+
     start_time = time.time()
-    try:
-        result = subprocess.run(
-            [sys.executable, "-c", code_string],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        exec_time = time.time() - start_time
+    with tempfile.TemporaryDirectory(prefix="slm_sandbox_") as temp_dir:
+        try:
+            result = subprocess.run(
+                [sys.executable, "-I", "-S", "-c", code_string],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                cwd=temp_dir,
+                env=sandbox_env,
+                preexec_fn=_limit_process_resources,
+            )
+            exec_time = time.time() - start_time
         
-        # 3. Dense Reward Zuweisung basierend auf Ausbeute
-        if result.returncode == 0:
-            return 2.0, exec_time # Perfekte Ausführung
-        elif "AssertionError" in result.stderr:
-            return 0.5, exec_time # Dense Reward: AST war okay, lief los, aber Logik-Fehler in Edge-Cases
-        else:
-            return 0.1, exec_time # Dense Reward: Konnte starten, brach aber wegen Runtime-Error ab
+            # 3. Dense Reward Zuweisung basierend auf Ausbeute
+            if result.returncode == 0:
+                return 2.0, exec_time # Perfekte Ausführung
+            elif "AssertionError" in result.stderr:
+                return 0.5, exec_time # Dense Reward: AST war okay, lief los, aber Logik-Fehler in Edge-Cases
+            else:
+                return 0.1, exec_time # Dense Reward: Konnte starten, brach aber wegen Runtime-Error ab
             
-    except subprocess.TimeoutExpired:
-        return -0.5, timeout # Dense Penalty: O(n^2) endlose Laufzeit
-    except Exception as e:
-        print(f"Sandbox fatal error: {e}")
-        return 0.0, 0.0
+        except subprocess.TimeoutExpired:
+            return -0.5, timeout # Dense Penalty: O(n^2) endlose Laufzeit
+        except Exception as e:
+            print(f"Sandbox fatal error: {e}")
+            return 0.0, 0.0

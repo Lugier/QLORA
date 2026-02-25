@@ -1,8 +1,7 @@
 import torch
 import os
-from datasets import load_dataset, load_from_disk
-from transformers import TrainingArguments, TrainerCallback
-import copy
+from datasets import load_dataset
+from transformers import TrainerCallback
 from unsloth import FastLanguageModel, PatchFastRL
 from trl import GRPOConfig, GRPOTrainer
 
@@ -27,6 +26,9 @@ class EMACheckpointCallback(TrainerCallback):
         self.ema_model_weights = None
         self.model = model
         self.decay = decay
+        self.trainable_param_names = {
+            name for name, param in self.model.named_parameters() if param.requires_grad
+        }
         
         # Aktivieren erst in den letzten 30% des Trainings (Late-Game Stabilization)
         self.start_ema_step = int(max_steps * 0.7)
@@ -38,16 +40,18 @@ class EMACheckpointCallback(TrainerCallback):
         with torch.no_grad():
             if self.ema_model_weights is None:
                 # Initialisiere EMA Gewichte beim ersten gültigen Step
+                state_dict = self.model.state_dict()
                 self.ema_model_weights = {
-                    k: v.clone().detach() 
-                    for k, v in self.model.state_dict().items() if v.requires_grad
+                    name: state_dict[name].clone().detach()
+                    for name in self.trainable_param_names
+                    if name in state_dict
                 }
             else:
                 # Fließender Durchschnitts-Update
                 state_dict = self.model.state_dict()
-                for k in self.ema_model_weights.keys():
-                    self.ema_model_weights[k].mul_(self.decay).add_(
-                        state_dict[k].detach(), alpha=1 - self.decay
+                for name in self.ema_model_weights.keys():
+                    self.ema_model_weights[name].mul_(self.decay).add_(
+                        state_dict[name].detach(), alpha=1 - self.decay
                     )
 
     def on_train_end(self, args, state, control, **kwargs):
@@ -65,12 +69,22 @@ def format_rl_prompt(example):
         "You are an expert python developer. Analyze thoroughly in <reasoning> tags, "
         "then output purely the executable code in <answer> tags."
     )
-    prompt = f"<|im_start|>system\n{system_prompt}<|im_end|>\n<|im_start|>user\n{example['text']}<|im_end|>\n<|im_start|>assistant\n"
-    
+    user_prompt = example.get("prompt", "") or example.get("text", "")
+    prompt = (
+        f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+
     # MBPP enthält die Unittests im Array 'test_list', welche wir verdeckt als `answer` übergeben.
-    tests = "\n".join(example.get('test_list', []))
-    
-    return {"prompt": prompt, "answer": tests}
+    test_list = example.get("test_list", [])
+    if isinstance(test_list, list):
+        tests = "\n".join([t for t in test_list if t])
+    else:
+        tests = str(test_list or "")
+
+    tests = tests.strip()
+    return {"prompt": prompt, "answer": tests, "has_tests": bool(tests)}
 
 
 def train_grpo():
@@ -97,16 +111,18 @@ def train_grpo():
          print(f"Loading learned SFT structural formats from '{sft_adapter_path}'...")
          model.load_adapter(sft_adapter_path)
     
-    # Für das Execution-Reward-Alignment nutzen wir    # Datensatz laden und formattieren
-    dataset_path = "./sota_best_of_n_dataset" # Basiert auf Destillations-Phase
-    if not os.path.exists(dataset_path):
-        dataset_path = "./sota_slm_coding_dataset" # Fallback auf SFT Dataset
-        
-    raw_dataset = load_from_disk(dataset_path)
-    # Entfernt evtl. leere Instruktionen/Lösungen für RL
-    raw_dataset = raw_dataset.filter(lambda x: len(x.get('text', '')) > 50) 
+    # Dataset laden für RL (MBPP um echte Test-Fälle für die Sandbox zu haben)
+    print("Loading continuous RL environment datasets (MBPP examples)...")
+    # Wir benutzen MBPP, damit das Modell in der Sandbox gegen echte Tests laufen kann
+    # Das behebt das RL-Datenleck, weil SFT 'text' bereits die Assistent-Antwort enthielt
+    raw_dataset = load_dataset("mbpp", "sanitized", split="train[:800]")
     
     rl_dataset = raw_dataset.map(format_rl_prompt, remove_columns=raw_dataset.column_names)
+    rl_dataset = rl_dataset.filter(lambda x: x["has_tests"])
+    print(f"Prepared {len(rl_dataset)} RL samples with hidden execution tests.")
+    if len(rl_dataset) == 0:
+        print("CRITICAL ERROR: No RL samples with tests available. Aborting.")
+        return
     
     # === Curriculum Learning (SOTA Optimization) ===
     # Wir sortieren den Datensatz aufsteigend nach der Länge (Komplexitäts-Proxy) des Prompts.
@@ -116,7 +132,7 @@ def train_grpo():
     rl_dataset = rl_dataset.map(lambda x: {"prompt_length": len(x["prompt"])})
     rl_dataset = rl_dataset.sort("prompt_length")
     
-    # 3. GRPOTrainer Configuration für Max-Reasoning VRAM-Gefahr: Wir erzeugen simultan num_generations=8 Antworten. 
+    # 3. GRPOTrainer Configuration für Max-Reasoning
     # Das kostet extrem viel Speicher. Daher Batch-Size auf 1 oder 2 limitieren.
     training_args = GRPOConfig(
         weight_decay = 0.1,
@@ -130,7 +146,7 @@ def train_grpo():
         max_prompt_length = 512,
         max_completion_length = 1500, # Bietet Platz für Multi-Turn Reflexion im Antwort-Token-Space
         fp16 = not torch.cuda.is_bfloat16_supported(),
-        bf16 = True, # Hardware Optimierung auf RTX 4090 / A100
+        bf16 = torch.cuda.is_bfloat16_supported(), # Hardware Optimierung auf RTX 4090 / A100
         optim = "adamw_8bit",
         # GRPO-spezifisch: KL-Strafe (verhindert das Abdriften des Modells in kryptische Ausgaben)
         beta = 0.05, 

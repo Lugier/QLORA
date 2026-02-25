@@ -6,6 +6,44 @@ from datasets import load_dataset, concatenate_datasets
 # SOTA SLM Data Preparation Pipeline
 # ==============================================================================
 
+
+def _extract_tests(example):
+    """
+    Normalize optional unit tests from heterogeneous dataset schemas.
+    """
+    candidates = [
+        example.get("tests"),
+        example.get("test"),
+        example.get("test_list"),
+        example.get("unit_tests"),
+        example.get("public_tests"),
+    ]
+    for value in candidates:
+        if not value:
+            continue
+        if isinstance(value, list):
+            return "\n".join([str(item) for item in value if item])
+        return str(value)
+    return ""
+
+
+def _prompt_prefix_from_text(formatted_text):
+    """
+    Keep only prompt context up to the assistant turn to avoid RL label leakage.
+    """
+    split_token = "<|im_start|>assistant\n"
+    if split_token in formatted_text:
+        return formatted_text.split(split_token, 1)[0] + split_token
+    return formatted_text
+
+
+def _build_record(example, formatted_text):
+    return {
+        "text": formatted_text,
+        "prompt": _prompt_prefix_from_text(formatted_text),
+        "tests": _extract_tests(example),
+    }
+
 def format_reasoning_prompt(example):
     """
     Integriert detaillierte Teacher-Rationales in den Datensatz für das SLM.
@@ -41,7 +79,7 @@ def format_reasoning_prompt(example):
             f"<|im_start|>assistant\n<answer>\n{solution}\n</answer><|im_end|>"
         )
 
-    return {"text": formatted_text}
+    return _build_record(example, formatted_text)
 
 
 def format_bug_prompt(example):
@@ -57,9 +95,6 @@ def format_bug_prompt(example):
     instruction = f"Issue Description: {example.get('problem_statement', '')}"
     solution = example.get('patch', '')
     
-    instruction = f"Issue Description: {example.get('problem_statement', '')}"
-    solution = example.get('patch', '')
-    
     # Kurze analytische Struktur simulieren für Konsistenz
     rationale = (
         "Analyzing the provided issue description to isolate the root cause. "
@@ -72,7 +107,7 @@ def format_bug_prompt(example):
         f"<|im_start|>assistant\n<reasoning>\n{rationale}\n</reasoning>\n"
         f"<answer>\n{solution}\n</answer><|im_end|>"
     )
-    return {"text": formatted_text}
+    return _build_record(example, formatted_text)
 
 
 def format_evol_prompt(example):
@@ -95,7 +130,7 @@ def format_evol_prompt(example):
         f"<|im_start|>user\n{instruction}<|im_end|>\n"
         f"<|im_start|>assistant\n<answer>\n{solution}\n</answer><|im_end|>"
     )
-    return {"text": formatted_text}
+    return _build_record(example, formatted_text)
 
 
 def format_trajectory_prompt(example):
@@ -126,7 +161,7 @@ def format_trajectory_prompt(example):
         f"<|im_start|>assistant\n<reasoning>\nTrajectory completed.\n</reasoning>\n"
         f"<answer>\nPatch ready based on trajectory exploration.\n</answer><|im_end|>"
     )
-    return {"text": formatted_text}
+    return _build_record(example, formatted_text)
 
 
 def format_stratos_prompt(example):
@@ -145,7 +180,7 @@ def format_stratos_prompt(example):
         f"<|im_start|>user\n{instruction}<|im_end|>\n"
         f"<|im_start|>assistant\n<answer>\n{solution}\n</answer><|im_end|>"
     )
-    return {"text": formatted_text}
+    return _build_record(example, formatted_text)
 
 
 def format_math_prompt(example):
@@ -165,7 +200,7 @@ def format_math_prompt(example):
         f"<|im_start|>assistant\n<reasoning>\nAnalyzing mathematical structure...\n</reasoning>\n"
         f"<answer>\n{solution}\n</answer><|im_end|>"
     )
-    return {"text": formatted_text}
+    return _build_record(example, formatted_text)
 
 
 def format_codefeedback_prompt(example):
@@ -185,7 +220,7 @@ def format_codefeedback_prompt(example):
         f"<|im_start|>assistant\n<reasoning>\nAnalyzing compiler/execution error to self-correct...\n</reasoning>\n"
         f"<answer>\n{solution}\n</answer><|im_end|>"
     )
-    return {"text": formatted_text}
+    return _build_record(example, formatted_text)
 
 
 def format_mcts_prompt(example):
@@ -211,7 +246,7 @@ def format_mcts_prompt(example):
         f"<|im_start|>assistant\n<reasoning>\nGenerating reasoning tree. Planning alternatives...\n</reasoning>\n"
         f"<answer>\n{solution}\n</answer><|im_end|>"
     )
-    return {"text": formatted_text}
+    return _build_record(example, formatted_text)
 
 
 def format_commitpack_prompt(example):
@@ -240,7 +275,7 @@ def format_commitpack_prompt(example):
         f"<|im_start|>assistant\n<reasoning>\nAnalyzing multi-file dependency graph...\n</reasoning>\n"
         f"<answer>\n{solution}\n</answer><|im_end|>"
     )
-    return {"text": formatted_text}
+    return _build_record(example, formatted_text)
 
 
 def build_sota_dataset(output_dir="./sota_slm_coding_dataset"):
@@ -339,15 +374,15 @@ def build_sota_dataset(output_dir="./sota_slm_coding_dataset"):
 
     # Aggregation & Speicherung
     datasets_to_concat = []
-    if ds_reasoning: datasets_to_concat.append(ds_reasoning)
-    if ds_stratos: datasets_to_concat.append(ds_stratos)
-    if ds_bugs: datasets_to_concat.append(ds_bugs)
-    if ds_evol: datasets_to_concat.append(ds_evol)
-    if ds_traj: datasets_to_concat.append(ds_traj)
-    if ds_math: datasets_to_concat.append(ds_math)
-    if ds_feedback: datasets_to_concat.append(ds_feedback)
-    if ds_mcts: datasets_to_concat.append(ds_mcts)
-    if ds_commit: datasets_to_concat.append(ds_commit)
+    if ds_reasoning is not None: datasets_to_concat.append(ds_reasoning)
+    if ds_stratos is not None: datasets_to_concat.append(ds_stratos)
+    if ds_bugs is not None: datasets_to_concat.append(ds_bugs)
+    if ds_evol is not None: datasets_to_concat.append(ds_evol)
+    if ds_traj is not None: datasets_to_concat.append(ds_traj)
+    if ds_math is not None: datasets_to_concat.append(ds_math)
+    if ds_feedback is not None: datasets_to_concat.append(ds_feedback)
+    if ds_mcts is not None: datasets_to_concat.append(ds_mcts)
+    if ds_commit is not None: datasets_to_concat.append(ds_commit)
     
     if not datasets_to_concat:
         print("Kritischer Fehler: Keine Datensätze konnten geladen werden.")

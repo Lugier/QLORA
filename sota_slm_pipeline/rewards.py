@@ -1,5 +1,5 @@
 import re
-from typing import List, Dict, Any
+from typing import List, Dict
 from sandbox import run_code_in_sandbox
 
 # ==============================================================================
@@ -89,7 +89,7 @@ def length_penalty_reward_func(prompts, completions, answer, **kwargs):
             rewards.append(-0.5) # Zu geschwätzig
         else:
             # Massive Strafe für Endlos-Loops oder extreme Geschwätzigkeit
-            penalty = min(-2.0, -0.5 - ((tokens - 1000) * 0.001))
+            penalty = max(-2.0, -0.5 - ((tokens - 1000) * 0.001))
             rewards.append(penalty)
             
     return rewards
@@ -139,6 +139,12 @@ def execution_reward_func(prompts: List[str], completions: List[Dict[str, str]],
     responses = [comp[0]["content"] if isinstance(comp, list) else comp["content"] for comp in completions]
     
     for resp, expected_tests in zip(responses, answer):
+        expected_tests = (expected_tests or "").strip()
+        if not expected_tests:
+            # No hidden tests -> no execution signal.
+            rewards.append(0.0)
+            continue
+
         extracted_code = extract_xml_content(resp, "answer")
         
         if not extracted_code:
