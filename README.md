@@ -137,6 +137,11 @@ Optional:
 export HF_TOKEN=hf_xxx
 ```
 
+One-command launcher:
+```bash
+bash scripts/runpod_deploy_and_train.sh
+```
+
 Spot-resume best practice:
 ```bash
 export RUN_ID=run_20260226_a
@@ -145,6 +150,48 @@ bash scripts/runpod_train_full.sh
 
 If the pod is interrupted, start a new pod with the same volume and run again with the same `RUN_ID`.
 Stage 0 baseline artifacts are reused, and training stages continue from checkpoints (`resume_from_checkpoint=auto`).
+
+## RunPod Step-by-Step (Detailed)
+
+1. Create the pod in RunPod:
+- GPU: `RTX 3090` (24GB) or stronger.
+- Use a PyTorch/CUDA image with Python 3.10 support.
+- Attach a persistent volume (important for spot resume).
+- Open the pod terminal.
+
+2. Clone and enter the project:
+```bash
+cd /workspace
+git clone https://github.com/Lugier/QLORA.git
+cd QLORA
+```
+
+3. Start full deploy + train in one command:
+```bash
+export HF_TOKEN=hf_xxx   # optional if private/gated model pulls are needed
+export RUN_ID=run_20260226_a
+bash scripts/runpod_deploy_and_train.sh
+```
+
+4. What this command does automatically:
+- Pulls/updates the repo (if needed).
+- Installs dependencies (`torch`, `unsloth`, `trl`, `vllm`, `swebench`).
+- Runs hard preflight checks (GPU, disk, CUDA, imports, trainer classes).
+- Starts full 13-stage training/evaluation/export pipeline.
+- Writes launcher logs to `run_manifests/<RUN_ID>/deploy_launcher.log`.
+
+5. Resume after spot interruption:
+```bash
+cd /workspace/QLORA
+export RUN_ID=run_20260226_a
+bash scripts/runpod_deploy_and_train.sh
+```
+- Keep the same volume and the same `RUN_ID`.
+- Existing manifests/checkpoints are reused.
+
+6. Where to check outputs:
+- Manifests/reports: `run_manifests/<RUN_ID>/`
+- Final exported models: `model_export_hf/`, `model_export_gguf/`
 
 ---
 
