@@ -446,6 +446,10 @@ def _build_training_args(stage_steps, stage_name, seed, stage_output_dir, checkp
         lr = 4e-6
         num_generations = 6
 
+    # Smooth transition from core_code -> repo_resolution phases to reduce phase-shock.
+    if stage_name.startswith("repo_"):
+        lr *= 0.92
+
     max_prompt_length, max_completion_length = _stage_context_lengths(stage_name, max_seq_length=max_seq_length)
 
     return _build_grpo_config(
@@ -468,6 +472,7 @@ def _build_training_args(stage_steps, stage_name, seed, stage_output_dir, checkp
         save_strategy="steps",
         save_steps=max(20, int(checkpoint_every_steps)),
         save_total_limit=2,
+        warmup_ratio=0.08,
         seed=seed,
         report_to=[],
     )

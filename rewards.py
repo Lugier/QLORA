@@ -210,6 +210,38 @@ def _adaptive_verifier_timeout(prompt: str, tests: str) -> float:
     return max(1.5, min(4.0, timeout))
 
 
+def diversity_exploration_reward_func(prompts, completions, answer, **kwargs):
+    """
+    Batch-local diversity shaping:
+    penalizes near-duplicate answers for identical prompts and rewards novel variants.
+    """
+    responses = [_completion_to_text(comp) for comp in completions]
+    groups = {}
+    normalized = []
+
+    for idx, (prompt, resp) in enumerate(zip(prompts, responses)):
+        answer_text = extract_xml_content(resp, "answer") or resp
+        answer_text = answer_text.replace("```python", "").replace("```", "").strip().lower()
+        fingerprint = re.sub(r"\s+", " ", answer_text)
+        if len(fingerprint) > 500:
+            fingerprint = fingerprint[:500]
+        normalized.append((str(prompt or ""), fingerprint))
+        groups.setdefault(str(prompt or ""), []).append(idx)
+
+    rewards = [0.0] * len(responses)
+    for prompt_key, indices in groups.items():
+        seen = {}
+        for idx in indices:
+            _prompt, fp = normalized[idx]
+            count = seen.get(fp, 0)
+            if count == 0:
+                rewards[idx] += 0.08
+            else:
+                rewards[idx] -= min(0.25, 0.10 + (0.05 * count))
+            seen[fp] = count + 1
+    return rewards
+
+
 def process_reward_func(prompts, completions, answer, **kwargs):
     """
     Lightweight PRM-style reward:
@@ -367,6 +399,7 @@ def get_reward_functions(profile: str):
         return [
             strict_format_reward_func,
             length_penalty_reward_func,
+            diversity_exploration_reward_func,
             self_verification_reward_func,
             execution_reward_func,
         ]
@@ -374,6 +407,7 @@ def get_reward_functions(profile: str):
         return [
             strict_format_reward_func,
             length_penalty_reward_func,
+            diversity_exploration_reward_func,
             process_reward_func,
             self_verification_reward_func,
             execution_reward_func,
@@ -383,6 +417,7 @@ def get_reward_functions(profile: str):
     return [
         strict_format_reward_func,
         length_penalty_reward_func,
+        diversity_exploration_reward_func,
         process_reward_func,
         self_verification_reward_func,
         execution_reward_func,

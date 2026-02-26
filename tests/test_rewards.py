@@ -50,6 +50,20 @@ class RewardTests(unittest.TestCase):
         weak_score = process_reward_func(prompts=prompts, completions=weak, answer=tests)[0]
         self.assertGreater(strong_score, weak_score)
 
+    def test_diversity_reward_penalizes_duplicates(self):
+        prompts = ["same prompt", "same prompt"]
+        completions = [
+            {"content": "<answer>def f(x):\n    return x + 1\n</answer>"},
+            {"content": "<answer>def f(x):\n    return x + 1\n</answer>"},
+        ]
+        values = rewards.diversity_exploration_reward_func(
+            prompts=prompts,
+            completions=completions,
+            answer=["", ""],
+        )
+        self.assertEqual(len(values), 2)
+        self.assertGreater(values[0], values[1])
+
 
 if __name__ == "__main__":
     unittest.main()

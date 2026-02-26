@@ -233,7 +233,7 @@ python3 phase1c_dpo.py \
   --sft-adapter-path qwen_sft_lora \
   --output-dir outputs_dpo \
   --output-model-dir qwen_dpo_lora \
-  --max-steps 800 \
+  --max-steps 600 \
   --min-score-gap 1.0 \
   --max-rejected-score 0.6 \
   --min-test-assert-count 2 \
