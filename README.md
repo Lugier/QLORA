@@ -142,6 +142,13 @@ One-command launcher:
 bash scripts/runpod_deploy_and_train.sh
 ```
 
+Local prepare + smoke:
+```bash
+export RUN_ID=local_smoke_01
+bash scripts/local_prepare_and_smoke.sh
+```
+- This runs static checks, CLI drift, unit tests, and automatically runs a mini baseline benchmark if local hardware/runtime is sufficient.
+
 Spot-resume best practice:
 ```bash
 export RUN_ID=run_20260226_a
