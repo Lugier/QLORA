@@ -1,6 +1,8 @@
 import argparse
+import hashlib
 import math
 import os
+import pickle
 import re
 from typing import Dict, List, Optional, Tuple
 
@@ -18,6 +20,7 @@ IGNORE_DIRS = {
     "node_modules",
     "dist",
     "build",
+    ".slm_cache",
 }
 
 INCLUDE_EXTS = {
@@ -31,6 +34,9 @@ INCLUDE_EXTS = {
     ".ini",
     ".cfg",
 }
+
+_CACHE_VERSION = 1
+_DOC_INDEX_MEMORY_CACHE: Dict[Tuple[str, int, int], Dict[str, object]] = {}
 
 
 def extract_xml_content(text: str, tag: str) -> str:
@@ -137,6 +143,79 @@ def _compute_idf(docs: List[Dict[str, object]], query_terms: List[str]) -> Dict[
     return idf
 
 
+def _repo_signature(repo_root: str, max_files_scan: int, max_chars_per_file: int) -> str:
+    entries = []
+    for path in _iter_candidate_files(repo_root, max_files=max_files_scan):
+        try:
+            stat = os.stat(path)
+            rel = os.path.relpath(path, repo_root)
+            entries.append(f"{rel}:{int(stat.st_mtime)}:{stat.st_size}")
+        except Exception:
+            continue
+    payload = f"v{_CACHE_VERSION}|{max_files_scan}|{max_chars_per_file}|" + "|".join(sorted(entries))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _cache_file_path(repo_root: str) -> str:
+    cache_dir = os.path.join(repo_root, ".slm_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, "retrieval_index_v1.pkl")
+
+
+def _load_cached_index(
+    repo_root: str,
+    max_files_scan: int,
+    max_chars_per_file: int,
+) -> List[Dict[str, object]]:
+    key = (repo_root, int(max_files_scan), int(max_chars_per_file))
+    signature = _repo_signature(repo_root, max_files_scan=max_files_scan, max_chars_per_file=max_chars_per_file)
+
+    in_memory = _DOC_INDEX_MEMORY_CACHE.get(key)
+    if in_memory and in_memory.get("signature") == signature:
+        return list(in_memory.get("docs", []))
+
+    cache_file = _cache_file_path(repo_root)
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "rb") as f:
+                payload = pickle.load(f)
+            if (
+                payload.get("version") == _CACHE_VERSION
+                and payload.get("signature") == signature
+                and payload.get("max_files_scan") == int(max_files_scan)
+                and payload.get("max_chars_per_file") == int(max_chars_per_file)
+            ):
+                docs = payload.get("docs", [])
+                _DOC_INDEX_MEMORY_CACHE[key] = {
+                    "signature": signature,
+                    "docs": docs,
+                }
+                return list(docs)
+        except Exception:
+            pass
+
+    docs = _build_doc_index(repo_root, max_files_scan=max_files_scan, max_chars_per_file=max_chars_per_file)
+    _DOC_INDEX_MEMORY_CACHE[key] = {
+        "signature": signature,
+        "docs": docs,
+    }
+    try:
+        with open(cache_file, "wb") as f:
+            pickle.dump(
+                {
+                    "version": _CACHE_VERSION,
+                    "signature": signature,
+                    "max_files_scan": int(max_files_scan),
+                    "max_chars_per_file": int(max_chars_per_file),
+                    "docs": docs,
+                },
+                f,
+            )
+    except Exception:
+        pass
+    return docs
+
+
 def retrieve_repo_context(
     query: str,
     repo_root: Optional[str],
@@ -157,7 +236,11 @@ def retrieve_repo_context(
     if not query_terms and not symbol_terms:
         return []
 
-    docs = _build_doc_index(repo_root, max_files_scan=max_files_scan, max_chars_per_file=max_chars_per_file)
+    docs = _load_cached_index(
+        repo_root,
+        max_files_scan=max_files_scan,
+        max_chars_per_file=max_chars_per_file,
+    )
     if not docs:
         return []
 
@@ -309,9 +392,11 @@ def _evaluate_completion(
             "stdout": "",
             "stderr": "Missing <answer> tags.",
             "error_type": "format",
+            "all_passed": False,
             "code": "",
             "completion_text": completion_text,
             "round_scores": [],
+            "pass_fraction": 0.0,
         }
 
     code = _strip_code_fences(code)
@@ -329,10 +414,224 @@ def _evaluate_completion(
         "stdout": str(best_detail.get("stdout", "") or ""),
         "stderr": str(best_detail.get("stderr", "") or ""),
         "error_type": str(best_detail.get("error_type", "") or ""),
+        "all_passed": bool(verify.get("all_passed", False)),
         "code": code,
         "completion_text": completion_text,
         "round_scores": list(verify.get("round_scores", [])),
+        "pass_fraction": float(verify.get("pass_fraction", 0.0)),
     }
+
+
+def _expand_beam_states(
+    llm: LLM,
+    states: List[Dict[str, object]],
+    tests: str,
+    timeout: float,
+    verifier_rounds: int,
+    round_idx: int,
+    candidate_budget: int,
+) -> List[Dict[str, object]]:
+    expanded: List[Dict[str, object]] = []
+    for state in states:
+        prompt = str(state.get("prompt", "") or "")
+        if not prompt:
+            continue
+        history = list(state.get("history", []))
+        context_prefix = str(state.get("context_prefix", "") or "")
+        context_blocks = list(state.get("context_blocks", []))
+
+        sampling_params = SamplingParams(
+            n=max(1, int(candidate_budget)),
+            temperature=float(state.get("temperature", 0.3)),
+            top_p=0.92,
+            max_tokens=1200,
+            stop=["<|im_end|>"],
+        )
+        outputs = llm.generate([prompt], sampling_params)
+        candidates = outputs[0].outputs if outputs else []
+        if not candidates:
+            continue
+
+        for candidate in candidates:
+            result = _evaluate_completion(
+                completion_text=candidate.text,
+                tests=tests,
+                timeout=timeout,
+                verifier_rounds=verifier_rounds,
+            )
+            node_score = (
+                float(result["score"])
+                + (0.25 * float(result.get("pass_fraction", 0.0)))
+                - (0.05 * float(round_idx))
+            )
+            result["node_score"] = node_score
+            result["round"] = round_idx
+            result["candidate_budget"] = candidate_budget
+            result["context_files"] = [x["path"] for x in context_blocks]
+            result["history"] = history
+            result["context_prefix"] = context_prefix
+            expanded.append(result)
+    return expanded
+
+
+def solve_with_tree_search(
+    llm: LLM,
+    user_prompt: str,
+    tests: str,
+    repo_root: Optional[str] = None,
+    max_rounds: int = 3,
+    n_candidates: int = 8,
+    candidate_schedule: str = "8,6,4",
+    beam_width: int = 2,
+    timeout: float = 2.0,
+    temperature: float = 0.3,
+    verifier_rounds: int = 2,
+) -> Dict[str, object]:
+    context_blocks = retrieve_repo_context(user_prompt, repo_root=repo_root)
+    context_text = _render_context_blocks(context_blocks)
+    context_prefix = _build_context_prefix(user_prompt, context_text)
+    initial_prompt = context_prefix + "<|im_start|>assistant\n"
+
+    schedule = _parse_candidate_schedule(candidate_schedule, base_candidates=n_candidates)
+    states = [
+        {
+            "prompt": initial_prompt,
+            "temperature": temperature,
+            "history": [],
+            "context_prefix": context_prefix,
+            "context_blocks": context_blocks,
+        }
+    ]
+    best = None
+
+    for round_idx in range(1, max_rounds + 1):
+        scheduled = schedule[min(round_idx - 1, len(schedule) - 1)]
+        expanded = _expand_beam_states(
+            llm=llm,
+            states=states,
+            tests=tests,
+            timeout=timeout,
+            verifier_rounds=verifier_rounds,
+            round_idx=round_idx,
+            candidate_budget=scheduled,
+        )
+        if not expanded:
+            break
+
+        expanded.sort(
+            key=lambda row: (
+                float(row.get("node_score", -10.0)),
+                float(row.get("score", -10.0)),
+                -float(row.get("exec_time", 999.0)),
+            ),
+            reverse=True,
+        )
+        best = expanded[0] if best is None or float(expanded[0]["node_score"]) > float(best.get("node_score", -999.0)) else best
+
+        for row in expanded:
+            if bool(row.get("all_passed", False)):
+                row["status"] = "passed"
+                return row
+
+        next_states = []
+        used_signatures = set()
+        for row in expanded:
+            if len(next_states) >= max(1, int(beam_width)):
+                break
+            code = str(row.get("code", "") or "")
+            if not code:
+                continue
+            signature = hashlib.sha256(code.encode("utf-8")).hexdigest()
+            if signature in used_signatures:
+                continue
+            used_signatures.add(signature)
+
+            updated_blocks = retrieve_repo_context(
+                query=user_prompt,
+                repo_root=repo_root,
+                hints=str(row.get("stderr", "") or ""),
+            ) or list(row.get("context_files", []))
+            if updated_blocks and isinstance(updated_blocks[0], str):
+                updated_blocks = retrieve_repo_context(user_prompt, repo_root=repo_root)
+            context_blocks = updated_blocks if isinstance(updated_blocks, list) else []
+            context_text = _render_context_blocks(context_blocks) if context_blocks else "No repository context available."
+            context_prefix = _build_context_prefix(user_prompt, context_text)
+            repair_prompt, next_temp = _build_repair_prompt(
+                context_prefix=context_prefix,
+                previous_completion=str(row.get("completion_text", "") or ""),
+                best_code=code,
+                failure=row,
+                round_idx=round_idx,
+            )
+            history = list(row.get("history", []))
+            history.append(
+                {
+                    "round": round_idx,
+                    "score": float(row.get("score", 0.0)),
+                    "pass_fraction": float(row.get("pass_fraction", 0.0)),
+                    "error_type": str(row.get("error_type", "") or ""),
+                    "candidate_budget": scheduled,
+                }
+            )
+            next_states.append(
+                {
+                    "prompt": repair_prompt,
+                    "temperature": next_temp,
+                    "history": history,
+                    "context_prefix": context_prefix,
+                    "context_blocks": context_blocks,
+                }
+            )
+
+        if not next_states:
+            break
+        states = next_states
+
+    if best is None:
+        return {
+            "status": "failed",
+            "score": -2.0,
+            "stderr": "No candidates were generated.",
+            "code": "",
+            "round": 0,
+            "context_files": [x["path"] for x in context_blocks],
+            "history": [],
+            "all_passed": False,
+        }
+    best["status"] = "failed"
+    best["all_passed"] = False
+    return best
+
+
+def _parse_candidate_schedule(candidate_schedule: str, base_candidates: int) -> List[int]:
+    parsed = []
+    for part in str(candidate_schedule or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            parsed.append(max(1, int(part)))
+        except ValueError:
+            continue
+    if parsed:
+        return parsed
+
+    base_candidates = max(4, int(base_candidates))
+    return [base_candidates, max(4, base_candidates - 2), max(4, base_candidates - 4)]
+
+
+def _budget_for_error(error_type: str, scheduled_budget: int) -> int:
+    scheduled_budget = max(1, int(scheduled_budget))
+    normalized = (error_type or "").strip().lower()
+    if normalized == "format":
+        return min(12, max(scheduled_budget, 8))
+    if normalized == "syntax":
+        return min(12, scheduled_budget + 1)
+    if normalized == "timeout":
+        return max(4, scheduled_budget - 1)
+    if normalized == "security":
+        return max(4, scheduled_budget - 2)
+    return scheduled_budget
 
 
 def solve_with_self_debug(
@@ -342,11 +641,31 @@ def solve_with_self_debug(
     repo_root: Optional[str] = None,
     max_rounds: int = 3,
     n_candidates: int = 8,
+    candidate_schedule: str = "8,6,4",
     timeout: float = 2.0,
     temperature: float = 0.3,
     verifier_rounds: int = 2,
     early_stop_patience: int = 2,
+    search_mode: str = "greedy",
+    beam_width: int = 2,
 ) -> Dict[str, object]:
+    search_mode = (search_mode or "greedy").strip().lower()
+    if search_mode in {"beam", "mcts"}:
+        # Lightweight tree search variant with verifier-guided reranking.
+        return solve_with_tree_search(
+            llm=llm,
+            user_prompt=user_prompt,
+            tests=tests,
+            repo_root=repo_root,
+            max_rounds=max_rounds,
+            n_candidates=n_candidates,
+            candidate_schedule=candidate_schedule,
+            beam_width=beam_width,
+            timeout=timeout,
+            temperature=temperature,
+            verifier_rounds=verifier_rounds,
+        )
+
     context_blocks = retrieve_repo_context(user_prompt, repo_root=repo_root)
     context_text = _render_context_blocks(context_blocks)
     context_prefix = _build_context_prefix(user_prompt, context_text)
@@ -357,10 +676,15 @@ def solve_with_self_debug(
     best_score_seen = -10.0
     stagnation_rounds = 0
     current_temperature = temperature
+    last_error_type = ""
+    schedule = _parse_candidate_schedule(candidate_schedule, base_candidates=n_candidates)
 
     for round_idx in range(1, max_rounds + 1):
+        scheduled = schedule[min(round_idx - 1, len(schedule) - 1)]
+        round_candidates = _budget_for_error(last_error_type, scheduled)
+
         sampling_params = SamplingParams(
-            n=n_candidates,
+            n=round_candidates,
             temperature=current_temperature,
             top_p=0.92,
             max_tokens=1200,
@@ -382,9 +706,10 @@ def solve_with_self_debug(
             round_results.append(result)
             if best_overall is None or result["score"] > best_overall["score"]:
                 best_overall = result
-            if result["score"] == 2.0:
+            if bool(result.get("all_passed", False)):
                 result["status"] = "passed"
                 result["round"] = round_idx
+                result["candidate_budget"] = round_candidates
                 result["context_files"] = [x["path"] for x in context_blocks]
                 result["history"] = history
                 return result
@@ -392,6 +717,7 @@ def solve_with_self_debug(
         round_results.sort(
             key=lambda x: (
                 float(x["score"]),
+                float(x.get("pass_fraction", 0.0)),
                 -float(x.get("exec_time", 999.0)),
             ),
             reverse=True,
@@ -404,11 +730,14 @@ def solve_with_self_debug(
         else:
             stagnation_rounds += 1
 
+        last_error_type = str(best_round.get("error_type", "") or "")
         history.append(
             {
                 "round": round_idx,
                 "score": best_round["score"],
-                "error_type": best_round.get("error_type", ""),
+                "pass_fraction": float(best_round.get("pass_fraction", 0.0)),
+                "error_type": last_error_type,
+                "candidate_budget": round_candidates,
                 "stderr": str(best_round.get("stderr", "") or "")[:300],
                 "round_scores": best_round.get("round_scores", []),
             }
@@ -445,12 +774,14 @@ def solve_with_self_debug(
             "round": 0,
             "context_files": [x["path"] for x in context_blocks],
             "history": history,
+            "all_passed": False,
         }
 
     best_overall["status"] = "failed"
     best_overall["context_files"] = [x["path"] for x in context_blocks]
     best_overall["history"] = history
     best_overall["round"] = len(history)
+    best_overall["all_passed"] = False
     return best_overall
 
 
@@ -478,10 +809,13 @@ def run_single_task(
     repo_root: Optional[str] = None,
     max_rounds: int = 3,
     n_candidates: int = 8,
+    candidate_schedule: str = "8,6,4",
     timeout: float = 2.0,
     max_model_len: int = 4096,
     verifier_rounds: int = 2,
     early_stop_patience: int = 2,
+    search_mode: str = "greedy",
+    beam_width: int = 2,
 ) -> Dict[str, object]:
     llm = _build_llm(model_path=model_path, max_model_len=max_model_len)
     return solve_with_self_debug(
@@ -491,9 +825,12 @@ def run_single_task(
         repo_root=repo_root,
         max_rounds=max_rounds,
         n_candidates=n_candidates,
+        candidate_schedule=candidate_schedule,
         timeout=timeout,
         verifier_rounds=verifier_rounds,
         early_stop_patience=early_stop_patience,
+        search_mode=search_mode,
+        beam_width=beam_width,
     )
 
 
@@ -505,10 +842,13 @@ if __name__ == "__main__":
     parser.add_argument("--repo-root", default="")
     parser.add_argument("--max-rounds", type=int, default=3)
     parser.add_argument("--n-candidates", type=int, default=8)
+    parser.add_argument("--candidate-schedule", default="8,6,4")
     parser.add_argument("--timeout", type=float, default=2.0)
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--verifier-rounds", type=int, default=2)
     parser.add_argument("--early-stop-patience", type=int, default=2)
+    parser.add_argument("--search-mode", default="greedy", choices=["greedy", "beam", "mcts"])
+    parser.add_argument("--beam-width", type=int, default=2)
     args = parser.parse_args()
 
     result = run_single_task(
@@ -518,9 +858,12 @@ if __name__ == "__main__":
         repo_root=args.repo_root or None,
         max_rounds=args.max_rounds,
         n_candidates=args.n_candidates,
+        candidate_schedule=args.candidate_schedule,
         timeout=args.timeout,
         max_model_len=args.max_model_len,
         verifier_rounds=args.verifier_rounds,
         early_stop_patience=args.early_stop_patience,
+        search_mode=args.search_mode,
+        beam_width=args.beam_width,
     )
     print(result)

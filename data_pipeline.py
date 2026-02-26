@@ -2,7 +2,10 @@ import os
 import hashlib
 import argparse
 import re
-from datasets import load_dataset, concatenate_datasets
+import ast
+from typing import Dict
+
+from datasets import DatasetDict, load_dataset, concatenate_datasets
 
 # ==============================================================================
 # SOTA SLM Data Preparation Pipeline
@@ -45,6 +48,121 @@ def _build_record(example, formatted_text):
         "prompt": _prompt_prefix_from_text(formatted_text),
         "tests": _extract_tests(example),
     }
+
+
+def _tag_source(dataset, source_name):
+    if dataset is None:
+        return None
+    return dataset.add_column("source", [source_name] * len(dataset))
+
+
+def _parse_source_weights(source_weights: str) -> Dict[str, float]:
+    default = {"code": 0.55, "repo": 0.30, "reasoning": 0.15}
+    if not source_weights:
+        return default
+    parsed = {}
+    for part in source_weights.split(","):
+        if ":" not in part:
+            continue
+        key, value = part.split(":", 1)
+        key = key.strip().lower()
+        try:
+            parsed[key] = float(value.strip())
+        except ValueError:
+            continue
+    merged = {**default, **parsed}
+    total = sum(max(0.0, v) for v in merged.values())
+    if total <= 0:
+        return default
+    return {k: max(0.0, v) / total for k, v in merged.items()}
+
+
+_SOURCE_CATEGORY = {
+    "nvidia/OpenCodeReasoning": "code",
+    "WizardLM/WizardLM_evol_instruct_V2_196k": "code",
+    "m-a-p/CodeFeedback-Filtered-Instruction": "code",
+    "O1-CODER/OpenO1-SFT": "code",
+    "princeton-nlp/SWE-bench_Lite": "repo",
+    "princeton-nlp/SWE-agent-trajectories": "repo",
+    "bigcode/commitpackft:python": "repo",
+    "SWE-bench-Live/SWE-bench-Live:verified": "repo",
+    "HuggingFaceH4/Bespoke-Stratos-17k": "reasoning",
+    "AI-MO/NuminaMath-CoT": "reasoning",
+}
+
+
+def _cap_sources(source_datasets, max_samples_per_source, seed=3407):
+    capped = {}
+    for source_name, dataset in source_datasets.items():
+        if dataset is None:
+            continue
+        if max_samples_per_source > 0 and len(dataset) > max_samples_per_source:
+            dataset = dataset.shuffle(seed=seed).select(range(max_samples_per_source))
+        capped[source_name] = dataset
+    return capped
+
+
+def _mix_sources_by_category(source_datasets, source_weights, seed=3407):
+    by_category = {"code": [], "repo": [], "reasoning": []}
+    for source_name, dataset in source_datasets.items():
+        if dataset is None or len(dataset) == 0:
+            continue
+        category = _SOURCE_CATEGORY.get(source_name, "code")
+        by_category.setdefault(category, []).append(dataset)
+
+    merged_by_category = {}
+    for category, datasets_in_cat in by_category.items():
+        if not datasets_in_cat:
+            continue
+        merged = concatenate_datasets(datasets_in_cat).shuffle(seed=seed)
+        merged_by_category[category] = merged
+
+    if not merged_by_category:
+        raise RuntimeError("No datasets available after category grouping.")
+
+    # Maximize total usable data while preserving desired proportions where possible.
+    available_total = sum(len(ds) for ds in merged_by_category.values())
+    if available_total <= 0:
+        raise RuntimeError("No weighted categories available for source mixing.")
+
+    categories = sorted(merged_by_category.keys())
+    desired = {}
+    remaining = available_total
+    for category in categories:
+        weight = max(0.0, source_weights.get(category, 0.0))
+        desired_count = int(available_total * weight)
+        desired[category] = min(len(merged_by_category[category]), max(0, desired_count))
+        remaining -= desired[category]
+
+    # Redistribute leftover budget to categories that still have unused capacity.
+    while remaining > 0:
+        progressed = False
+        for category in categories:
+            slack = len(merged_by_category[category]) - desired[category]
+            if slack <= 0:
+                continue
+            desired[category] += 1
+            remaining -= 1
+            progressed = True
+            if remaining <= 0:
+                break
+        if not progressed:
+            break
+
+    selected = []
+    for category in categories:
+        ds = merged_by_category[category]
+        target = desired.get(category, 0)
+        if target <= 0:
+            continue
+        selected.append(ds.select(range(target)))
+
+    mixed = concatenate_datasets(selected).shuffle(seed=seed)
+    print(
+        "Applied source-mix weights: "
+        + ", ".join([f"{k}={source_weights.get(k, 0.0):.2f}" for k in ["code", "repo", "reasoning"]])
+    )
+    return mixed
 
 
 def _deterministic_reasoning_mode(example, ratio=0.7):
@@ -339,9 +457,29 @@ def _normalize_for_dedup(text):
     return re.sub(r"[^a-z0-9_<>/| ]", "", lowered)
 
 
-def _drop_prompt_duplicates(dataset):
+def _extract_answer_from_text(text):
+    text = _text(text)
+    match = re.search(r"<answer>\s*(.*?)\s*</answer>", text, flags=re.DOTALL)
+    if not match:
+        return ""
+    return match.group(1).strip()
+
+
+def _is_answer_ast_parseable(text):
+    answer = _extract_answer_from_text(text)
+    if not answer:
+        return False
+    answer = answer.replace("```python", "").replace("```", "").strip()
+    try:
+        ast.parse(answer)
+        return True
+    except Exception:
+        return False
+
+
+def _drop_prompt_answer_duplicates(dataset):
     """
-    Remove exact/near-exact prompt duplicates to reduce memorization and noisy weighting.
+    Remove exact/near-exact prompt+answer duplicates to reduce memorization and leakage risk.
     """
     seen = set()
     keep_indices = []
@@ -349,7 +487,9 @@ def _drop_prompt_duplicates(dataset):
 
     for idx, row in enumerate(dataset):
         prompt = row.get("prompt", "") or _prompt_prefix_from_text(row.get("text", ""))
-        key = hashlib.sha256(_normalize_for_dedup(prompt).encode("utf-8")).hexdigest()
+        answer = _extract_answer_from_text(row.get("text", ""))
+        dedup_key = f"{_normalize_for_dedup(prompt)}||{_normalize_for_dedup(answer)}"
+        key = hashlib.sha256(dedup_key.encode("utf-8")).hexdigest()
         if key in seen:
             removed += 1
             continue
@@ -363,6 +503,8 @@ def _collect_quality_metrics(dataset, pre_dedup_count, dedup_removed):
     total = len(dataset)
     with_tests = 0
     with_prompt = 0
+    with_asserts = 0
+    answer_parse_ok = 0
 
     for row in dataset:
         prompt = (row.get("prompt", "") or "").strip()
@@ -371,20 +513,73 @@ def _collect_quality_metrics(dataset, pre_dedup_count, dedup_removed):
             with_prompt += 1
         if tests:
             with_tests += 1
+            if "assert " in tests:
+                with_asserts += 1
+        if row.get("answer_ast_ok", False):
+            answer_parse_ok += 1
 
     test_coverage = (with_tests / total) if total else 0.0
     prompt_coverage = (with_prompt / total) if total else 0.0
     unique_ratio = (total / pre_dedup_count) if pre_dedup_count else 0.0
     dedup_ratio = (dedup_removed / pre_dedup_count) if pre_dedup_count else 0.0
+    answer_ast_parse_rate = (answer_parse_ok / total) if total else 0.0
+    assert_density_in_tests = (with_asserts / with_tests) if with_tests else 0.0
 
     return {
         "total": total,
         "with_tests": with_tests,
         "with_prompt": with_prompt,
+        "with_asserts": with_asserts,
         "test_coverage": test_coverage,
         "prompt_coverage": prompt_coverage,
         "unique_ratio": unique_ratio,
         "dedup_ratio": dedup_ratio,
+        "answer_ast_parse_rate": answer_ast_parse_rate,
+        "assert_density_in_tests": assert_density_in_tests,
+    }
+
+
+def _stable_hash_bucket(text, modulo=1000):
+    digest = hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) % modulo
+
+
+def _split_train_val_holdout(dataset, holdout_policy="source_hash_v1", holdout_fraction=0.10, val_fraction=0.05):
+    holdout_fraction = max(0.01, min(0.5, holdout_fraction))
+    val_fraction = max(0.01, min(0.4, val_fraction))
+    holdout_mod = max(1, int(1000 * holdout_fraction))
+    val_mod = max(1, int(1000 * val_fraction))
+
+    train_idx = []
+    val_idx = []
+    holdout_idx = []
+
+    for idx, row in enumerate(dataset):
+        prompt = row.get("prompt", "") or ""
+        source = row.get("source", "unknown")
+        answer = _extract_answer_from_text(row.get("text", ""))
+        key = f"{source}||{prompt}||{answer}"
+
+        bucket = _stable_hash_bucket(key, modulo=1000)
+        if holdout_policy == "source_hash_v1" and bucket < holdout_mod:
+            holdout_idx.append(idx)
+            continue
+        if bucket < holdout_mod + val_mod:
+            val_idx.append(idx)
+        else:
+            train_idx.append(idx)
+
+    if not train_idx:
+        raise RuntimeError("Train split is empty after holdout split.")
+    if not val_idx:
+        raise RuntimeError("Val split is empty after holdout split.")
+    if not holdout_idx:
+        raise RuntimeError("Holdout split is empty after holdout split.")
+
+    return {
+        "train": dataset.select(train_idx),
+        "val_strict": dataset.select(val_idx),
+        "holdout_clean": dataset.select(holdout_idx),
     }
 
 
@@ -401,7 +596,15 @@ def build_sota_dataset(
     min_test_coverage=0.08,
     min_prompt_coverage=0.99,
     min_unique_ratio=0.75,
-    max_missing_sources=6,
+    max_missing_sources=8,
+    source_weights="code:0.55,repo:0.30,reasoning:0.15",
+    max_samples_per_source=25000,
+    min_answer_ast_parse_rate=0.98,
+    min_assert_density_in_tests=0.65,
+    holdout_policy="source_hash_v1",
+    holdout_fraction=0.10,
+    val_fraction=0.05,
+    seed=3407,
 ):
     """
     Kombiniert Reasoning-Traces und verifizierte Bugs zu einem hochqualitativen SFT-Korpus.
@@ -419,6 +622,7 @@ def build_sota_dataset(
             and _has_nonempty_text(x.get("solution"))
         )
         ds_reasoning = ds_reasoning.map(format_reasoning_prompt, remove_columns=ds_reasoning.column_names)
+        ds_reasoning = _tag_source(ds_reasoning, "nvidia/OpenCodeReasoning")
         source_stats["nvidia/OpenCodeReasoning"] = len(ds_reasoning)
     except Exception as e:
         print(f"Warnung: Konnte nvidia/OpenCodeReasoning nicht laden. Fehler: {e}")
@@ -435,6 +639,7 @@ def build_sota_dataset(
             and _has_nonempty_text(x.get("response", x.get("generation")))
         )
         ds_stratos = ds_stratos.map(format_stratos_prompt, remove_columns=ds_stratos.column_names)
+        ds_stratos = _tag_source(ds_stratos, "HuggingFaceH4/Bespoke-Stratos-17k")
         source_stats["HuggingFaceH4/Bespoke-Stratos-17k"] = len(ds_stratos)
     except Exception as e:
         print(f"Warnung: Konnte Stratos nicht laden. Fehler: {e}")
@@ -451,6 +656,7 @@ def build_sota_dataset(
             and _has_nonempty_text(x.get("patch"))
         )
         ds_bugs = ds_bugs.map(format_bug_prompt, remove_columns=ds_bugs.column_names)
+        ds_bugs = _tag_source(ds_bugs, "princeton-nlp/SWE-bench_Lite")
         source_stats["princeton-nlp/SWE-bench_Lite"] = len(ds_bugs)
     except Exception as e:
         print(f"Warnung: Konnte princeton-nlp/SWE-bench_Lite nicht laden. Fehler: {e}")
@@ -468,6 +674,7 @@ def build_sota_dataset(
             and _has_nonempty_text(x.get("output"))
         )
         ds_evol = ds_evol.map(format_evol_prompt, remove_columns=ds_evol.column_names)
+        ds_evol = _tag_source(ds_evol, "WizardLM/WizardLM_evol_instruct_V2_196k")
         source_stats["WizardLM/WizardLM_evol_instruct_V2_196k"] = len(ds_evol)
     except Exception as e:
         print(f"Warnung: Konnte Evol-Instruct nicht laden. Fehler: {e}")
@@ -489,6 +696,7 @@ def build_sota_dataset(
             and bool(x.get("trajectory"))
         )
         ds_traj = ds_traj.map(format_trajectory_prompt, remove_columns=ds_traj.column_names)
+        ds_traj = _tag_source(ds_traj, "princeton-nlp/SWE-agent-trajectories")
         source_stats["princeton-nlp/SWE-agent-trajectories"] = len(ds_traj)
     except Exception as e:
         print(f"Warnung: Konnte SWE-agent Trajectories nicht laden. Fehler: {e}")
@@ -505,6 +713,7 @@ def build_sota_dataset(
             and _has_nonempty_text(x.get("solution"))
         )
         ds_math = ds_math.map(format_math_prompt, remove_columns=ds_math.column_names)
+        ds_math = _tag_source(ds_math, "AI-MO/NuminaMath-CoT")
         source_stats["AI-MO/NuminaMath-CoT"] = len(ds_math)
     except Exception as e:
         print(f"Warnung: Konnte NuminaMath nicht laden. Fehler: {e}")
@@ -521,6 +730,7 @@ def build_sota_dataset(
             and _has_nonempty_text(x.get("answer"))
         )
         ds_feedback = ds_feedback.map(format_codefeedback_prompt, remove_columns=ds_feedback.column_names)
+        ds_feedback = _tag_source(ds_feedback, "m-a-p/CodeFeedback-Filtered-Instruction")
         source_stats["m-a-p/CodeFeedback-Filtered-Instruction"] = len(ds_feedback)
     except Exception as e:
         print(f"Warnung: Konnte CodeFeedback nicht laden. Fehler: {e}")
@@ -539,6 +749,7 @@ def build_sota_dataset(
             and _has_nonempty_text(x.get("output", x.get("response")))
         )
         ds_mcts = ds_mcts.map(format_mcts_prompt, remove_columns=ds_mcts.column_names)
+        ds_mcts = _tag_source(ds_mcts, "O1-CODER/OpenO1-SFT")
         source_stats["O1-CODER/OpenO1-SFT"] = len(ds_mcts)
     except Exception as e:
         print(f"Warnung: Konnte MCTS Dataset nicht laden. Fehler: {e}")
@@ -557,6 +768,7 @@ def build_sota_dataset(
             and _has_nonempty_text(x.get("message", x.get("old_contents")))
         )
         ds_commit = ds_commit.map(format_commitpack_prompt, remove_columns=ds_commit.column_names)
+        ds_commit = _tag_source(ds_commit, "bigcode/commitpackft:python")
         source_stats["bigcode/commitpackft:python"] = len(ds_commit)
     except Exception as e:
         print(f"Warnung: Konnte CommitPackFT nicht laden. Fehler: {e}")
@@ -564,19 +776,38 @@ def build_sota_dataset(
         source_stats["bigcode/commitpackft:python"] = 0
         missing_sources.append("bigcode/commitpackft:python")
 
-    # Aggregation & Speicherung
-    datasets_to_concat = []
-    if ds_reasoning is not None: datasets_to_concat.append(ds_reasoning)
-    if ds_stratos is not None: datasets_to_concat.append(ds_stratos)
-    if ds_bugs is not None: datasets_to_concat.append(ds_bugs)
-    if ds_evol is not None: datasets_to_concat.append(ds_evol)
-    if ds_traj is not None: datasets_to_concat.append(ds_traj)
-    if ds_math is not None: datasets_to_concat.append(ds_math)
-    if ds_feedback is not None: datasets_to_concat.append(ds_feedback)
-    if ds_mcts is not None: datasets_to_concat.append(ds_mcts)
-    if ds_commit is not None: datasets_to_concat.append(ds_commit)
-    
-    if not datasets_to_concat:
+    # 9. SWE-bench-Live Verified (fresh real-world repo issues).
+    print("Loading SWE-bench-Live verified for up-to-date repository fixing...")
+    try:
+        ds_swe_live = load_dataset("SWE-bench-Live/SWE-bench-Live", split="verified[:8000]")
+        ds_swe_live = ds_swe_live.filter(
+            lambda x: _has_nonempty_text(x.get("problem_statement"))
+            and _has_nonempty_text(x.get("patch"))
+        )
+        ds_swe_live = ds_swe_live.map(format_bug_prompt, remove_columns=ds_swe_live.column_names)
+        ds_swe_live = _tag_source(ds_swe_live, "SWE-bench-Live/SWE-bench-Live:verified")
+        source_stats["SWE-bench-Live/SWE-bench-Live:verified"] = len(ds_swe_live)
+    except Exception as e:
+        print(f"Warnung: Konnte SWE-bench-Live verified nicht laden. Fehler: {e}")
+        ds_swe_live = None
+        source_stats["SWE-bench-Live/SWE-bench-Live:verified"] = 0
+        missing_sources.append("SWE-bench-Live/SWE-bench-Live:verified")
+
+    # Aggregation, Reweighting, Dedup & Split
+    source_datasets = {
+        "nvidia/OpenCodeReasoning": ds_reasoning,
+        "HuggingFaceH4/Bespoke-Stratos-17k": ds_stratos,
+        "princeton-nlp/SWE-bench_Lite": ds_bugs,
+        "WizardLM/WizardLM_evol_instruct_V2_196k": ds_evol,
+        "princeton-nlp/SWE-agent-trajectories": ds_traj,
+        "AI-MO/NuminaMath-CoT": ds_math,
+        "m-a-p/CodeFeedback-Filtered-Instruction": ds_feedback,
+        "O1-CODER/OpenO1-SFT": ds_mcts,
+        "bigcode/commitpackft:python": ds_commit,
+        "SWE-bench-Live/SWE-bench-Live:verified": ds_swe_live,
+    }
+    source_datasets = {k: v for k, v in source_datasets.items() if v is not None and len(v) > 0}
+    if not source_datasets:
         raise RuntimeError("Kritischer Fehler: Keine Datensätze konnten geladen werden.")
 
     _print_source_report(source_stats)
@@ -585,21 +816,36 @@ def build_sota_dataset(
             f"Zu viele fehlende Datenquellen ({len(missing_sources)} > {max_missing_sources}): {missing_sources}"
         )
 
-    final_ds = concatenate_datasets(datasets_to_concat).shuffle(seed=3407)
+    source_datasets = _cap_sources(
+        source_datasets,
+        max_samples_per_source=max_samples_per_source,
+        seed=seed,
+    )
+    parsed_weights = _parse_source_weights(source_weights)
+    final_ds = _mix_sources_by_category(
+        source_datasets,
+        source_weights=parsed_weights,
+        seed=seed,
+    )
     final_ds = final_ds.filter(
         lambda x: _has_nonempty_text(x.get("text"))
         and _has_nonempty_text(x.get("prompt"))
         and "<answer>" in _text(x.get("text"))
         and "</answer>" in _text(x.get("text"))
     )
+    final_ds = final_ds.map(
+        lambda x: {"answer_ast_ok": _is_answer_ast_parseable(x.get("text", ""))}
+    )
     pre_dedup_count = len(final_ds)
-    final_ds, dedup_removed = _drop_prompt_duplicates(final_ds)
+    final_ds, dedup_removed = _drop_prompt_answer_duplicates(final_ds)
     metrics = _collect_quality_metrics(final_ds, pre_dedup_count, dedup_removed)
 
     print(
         "Quality Metrics: "
         f"total={metrics['total']}, "
         f"test_coverage={metrics['test_coverage']:.3f}, "
+        f"assert_density_in_tests={metrics['assert_density_in_tests']:.3f}, "
+        f"answer_ast_parse_rate={metrics['answer_ast_parse_rate']:.3f}, "
         f"prompt_coverage={metrics['prompt_coverage']:.3f}, "
         f"unique_ratio={metrics['unique_ratio']:.3f}, "
         f"dedup_ratio={metrics['dedup_ratio']:.3f}"
@@ -613,6 +859,16 @@ def build_sota_dataset(
         raise RuntimeError(
             f"Test-Coverage zu niedrig: {metrics['test_coverage']:.3f} < min_test_coverage={min_test_coverage}"
         )
+    if metrics["assert_density_in_tests"] < min_assert_density_in_tests:
+        raise RuntimeError(
+            "Assert-Density in Tests zu niedrig: "
+            f"{metrics['assert_density_in_tests']:.3f} < min_assert_density_in_tests={min_assert_density_in_tests}"
+        )
+    if metrics["answer_ast_parse_rate"] < min_answer_ast_parse_rate:
+        raise RuntimeError(
+            "Answer-AST-Parse-Rate zu niedrig: "
+            f"{metrics['answer_ast_parse_rate']:.3f} < min_answer_ast_parse_rate={min_answer_ast_parse_rate}"
+        )
     if metrics["prompt_coverage"] < min_prompt_coverage:
         raise RuntimeError(
             f"Prompt-Coverage zu niedrig: {metrics['prompt_coverage']:.3f} < min_prompt_coverage={min_prompt_coverage}"
@@ -621,10 +877,31 @@ def build_sota_dataset(
         raise RuntimeError(
             f"Unique-Ratio zu niedrig: {metrics['unique_ratio']:.3f} < min_unique_ratio={min_unique_ratio}"
         )
-    
+
+    # Remove non-parseable answers from final train/eval splits.
+    final_ds = final_ds.filter(lambda x: bool(x.get("answer_ast_ok", False)))
+
+    splits = _split_train_val_holdout(
+        final_ds,
+        holdout_policy=holdout_policy,
+        holdout_fraction=holdout_fraction,
+        val_fraction=val_fraction,
+    )
+    dataset_dict = DatasetDict(
+        {
+            "train": splits["train"],
+            "val_strict": splits["val_strict"],
+            "holdout_clean": splits["holdout_clean"],
+        }
+    )
     os.makedirs(os.path.dirname(output_dir) or ".", exist_ok=True)
-    final_ds.save_to_disk(output_dir)
-    print(f"Dataset successfully compiled with {len(final_ds)} reasoning-augmented instances.")
+    dataset_dict.save_to_disk(output_dir)
+    print(
+        "Dataset successfully compiled and split: "
+        f"train={len(splits['train'])}, "
+        f"val_strict={len(splits['val_strict'])}, "
+        f"holdout_clean={len(splits['holdout_clean'])}"
+    )
     print(f"Saved to: {output_dir}")
 
 if __name__ == "__main__":
@@ -634,7 +911,15 @@ if __name__ == "__main__":
     parser.add_argument("--min-test-coverage", type=float, default=0.08)
     parser.add_argument("--min-prompt-coverage", type=float, default=0.99)
     parser.add_argument("--min-unique-ratio", type=float, default=0.75)
-    parser.add_argument("--max-missing-sources", type=int, default=6)
+    parser.add_argument("--max-missing-sources", type=int, default=8)
+    parser.add_argument("--source-weights", default="code:0.55,repo:0.30,reasoning:0.15")
+    parser.add_argument("--max-samples-per-source", type=int, default=25000)
+    parser.add_argument("--min-answer-ast-parse-rate", type=float, default=0.98)
+    parser.add_argument("--min-assert-density-in-tests", type=float, default=0.65)
+    parser.add_argument("--holdout-policy", default="source_hash_v1")
+    parser.add_argument("--holdout-fraction", type=float, default=0.10)
+    parser.add_argument("--val-fraction", type=float, default=0.05)
+    parser.add_argument("--seed", type=int, default=3407)
     args = parser.parse_args()
 
     build_sota_dataset(
@@ -644,4 +929,12 @@ if __name__ == "__main__":
         min_prompt_coverage=args.min_prompt_coverage,
         min_unique_ratio=args.min_unique_ratio,
         max_missing_sources=args.max_missing_sources,
+        source_weights=args.source_weights,
+        max_samples_per_source=args.max_samples_per_source,
+        min_answer_ast_parse_rate=args.min_answer_ast_parse_rate,
+        min_assert_density_in_tests=args.min_assert_density_in_tests,
+        holdout_policy=args.holdout_policy,
+        holdout_fraction=args.holdout_fraction,
+        val_fraction=args.val_fraction,
+        seed=args.seed,
     )

@@ -1,6 +1,8 @@
+import ast
 import math
 import re
-from typing import Dict, List
+import textwrap
+from typing import Dict, List, Tuple
 
 from sandbox import run_code_in_sandbox_detailed
 
@@ -29,6 +31,44 @@ _PROPERTY_TERMS = (
     "sorted",
 )
 _RANDOM_TERMS = ("random", "randint", "shuffle", "sample", "seed", "hypothesis")
+_ASSERT_COUNT_TAG = "__SLM_ASSERT_COUNTS__"
+
+
+class _AssertCounterTransformer(ast.NodeTransformer):
+    """
+    Rewrites `assert expr` into counter updates for fractional execution rewards.
+    """
+
+    def visit_Assert(self, node):
+        total_inc = ast.AugAssign(
+            target=ast.Name(id="__slm_assert_total", ctx=ast.Store()),
+            op=ast.Add(),
+            value=ast.Constant(value=1),
+        )
+        pass_inc = ast.AugAssign(
+            target=ast.Name(id="__slm_assert_passed", ctx=ast.Store()),
+            op=ast.Add(),
+            value=ast.Constant(value=1),
+        )
+        safe_eval = ast.Try(
+            body=[
+                ast.If(
+                    test=node.test,
+                    body=[pass_inc],
+                    orelse=[],
+                )
+            ],
+            handlers=[
+                ast.ExceptHandler(
+                    type=ast.Name(id="Exception", ctx=ast.Load()),
+                    name=None,
+                    body=[ast.Pass()],
+                )
+            ],
+            orelse=[],
+            finalbody=[],
+        )
+        return [ast.copy_location(total_inc, node), ast.copy_location(safe_eval, node)]
 
 
 def assess_test_quality(tests: str) -> Dict[str, float]:
@@ -52,7 +92,6 @@ def assess_test_quality(tests: str) -> Dict[str, float]:
     property_hits = sum(1 for token in _PROPERTY_TERMS if token in lowered)
     random_hits = sum(1 for token in _RANDOM_TERMS if token in lowered)
 
-    # Weighted heuristic: assertions + structural tests + diversity hints.
     quality_score = (
         (0.9 * assert_count)
         + (1.2 * test_fn_count)
@@ -98,6 +137,82 @@ def _compose_eval_code(code: str, tests: str, seed: int) -> str:
     return f"{code}\n\n# --- Verifier Seed Prelude ---\n{prelude}\n# --- Unit Tests ---\n{tests}"
 
 
+def _instrument_tests_for_fractional_counts(tests: str) -> str:
+    try:
+        tree = ast.parse(tests)
+    except Exception:
+        return ""
+    transformed = _AssertCounterTransformer().visit(tree)
+    transformed = ast.fix_missing_locations(transformed)
+    try:
+        return ast.unparse(transformed)
+    except Exception:
+        return ""
+
+
+def _compose_fractional_eval_code(code: str, tests: str, seed: int) -> str:
+    transformed_tests = _instrument_tests_for_fractional_counts(tests)
+    if not transformed_tests:
+        return ""
+
+    prelude = (
+        "import random as __slm_random\n"
+        "try:\n"
+        f"    __slm_random.seed({seed})\n"
+        "except Exception:\n"
+        "    pass\n"
+    )
+    safe_test_block = textwrap.indent(transformed_tests, "    ")
+    return (
+        f"{code}\n\n"
+        f"{prelude}\n"
+        "__slm_assert_passed = 0\n"
+        "__slm_assert_total = 0\n"
+        "try:\n"
+        f"{safe_test_block}\n"
+        "except Exception:\n"
+        "    pass\n"
+        "finally:\n"
+        f"    print('{_ASSERT_COUNT_TAG}', __slm_assert_passed, __slm_assert_total)\n"
+    )
+
+
+def _parse_assert_counts(stdout: str) -> Tuple[int, int]:
+    pattern = re.compile(rf"{_ASSERT_COUNT_TAG}\s+(\d+)\s+(\d+)")
+    match = pattern.search(stdout or "")
+    if not match:
+        return 0, 0
+    return int(match.group(1)), int(match.group(2))
+
+
+def _fractional_assert_execution(code: str, tests: str, timeout: float = 2.0) -> Dict[str, object]:
+    eval_code = _compose_fractional_eval_code(code, tests, seed=0)
+    if not eval_code:
+        return {
+            "assert_passed": 0,
+            "assert_total": 0,
+            "pass_fraction": 0.0,
+            "error_type": "fractional_unavailable",
+        }
+
+    detail = run_code_in_sandbox_detailed(eval_code, timeout=timeout)
+    passed, total = _parse_assert_counts(str(detail.get("stdout", "") or ""))
+    if total <= 0:
+        return {
+            "assert_passed": 0,
+            "assert_total": 0,
+            "pass_fraction": 0.0,
+            "error_type": str(detail.get("error_type", "") or "fractional_unavailable"),
+        }
+
+    return {
+        "assert_passed": max(0, min(passed, total)),
+        "assert_total": total,
+        "pass_fraction": max(0.0, min(1.0, passed / max(1, total))),
+        "error_type": str(detail.get("error_type", "") or ""),
+    }
+
+
 def run_test_verifier(
     code: str,
     tests: str,
@@ -113,6 +228,10 @@ def run_test_verifier(
             "all_passed": False,
             "round_scores": [],
             "round_details": [],
+            "pass_fraction": 0.0,
+            "assert_passed": 0,
+            "assert_total": 0,
+            "error_counts": {},
             "quality": assess_test_quality(""),
         }
 
@@ -121,6 +240,7 @@ def run_test_verifier(
     details: List[Dict[str, object]] = []
     max_exec_time = 0.0
     best_success_time = math.inf
+    error_counts: Dict[str, int] = {}
 
     for seed in range(rounds):
         eval_code = _compose_eval_code(code, normalized_tests, seed=seed)
@@ -132,6 +252,10 @@ def run_test_verifier(
         max_exec_time = max(max_exec_time, exec_time)
         if score == 2.0:
             best_success_time = min(best_success_time, exec_time)
+
+        error_type = str(result.get("error_type", "") or "")
+        if error_type:
+            error_counts[error_type] = error_counts.get(error_type, 0) + 1
 
     all_passed = all(score == 2.0 for score in scores)
     if all_passed:
@@ -149,6 +273,14 @@ def run_test_verifier(
         ),
     )[0]
 
+    fractional = _fractional_assert_execution(code=code, tests=normalized_tests, timeout=timeout)
+    pass_fraction = float(fractional.get("pass_fraction", 0.0))
+    assert_passed = int(fractional.get("assert_passed", 0))
+    assert_total = int(fractional.get("assert_total", 0))
+
+    if assert_total == 0 and all_passed:
+        pass_fraction = 1.0
+
     return {
         "score": final_score,
         "exec_time": final_exec_time,
@@ -156,5 +288,9 @@ def run_test_verifier(
         "round_scores": scores,
         "round_details": details,
         "best_detail": best_detail,
+        "pass_fraction": pass_fraction,
+        "assert_passed": assert_passed,
+        "assert_total": assert_total,
+        "error_counts": error_counts,
         "quality": assess_test_quality(normalized_tests),
     }

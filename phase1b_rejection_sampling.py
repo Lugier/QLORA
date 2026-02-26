@@ -1,7 +1,7 @@
 import argparse
 import os
 import torch
-from datasets import load_from_disk, Dataset
+from datasets import Dataset, DatasetDict, load_from_disk
 from vllm import LLM, SamplingParams
 import re
 from verification import assess_test_quality, is_test_quality_sufficient, run_test_verifier
@@ -37,6 +37,54 @@ def _truncate_prompt(prompt: str, max_prompt_chars: int) -> str:
         return prompt[:keep] + assistant_token
     return prompt[:max_prompt_chars]
 
+
+def _parse_temperatures(value):
+    if isinstance(value, (list, tuple)):
+        parsed = [float(v) for v in value]
+    else:
+        parsed = []
+        for part in str(value or "").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                parsed.append(float(part))
+            except ValueError:
+                continue
+    valid = [max(0.0, min(1.5, temp)) for temp in parsed]
+    return valid if valid else [0.2, 0.8]
+
+
+def _compute_pair_weight(pair_weighting: str, score_gap: float) -> float:
+    mode = (pair_weighting or "none").strip().lower()
+    if mode == "score_gap":
+        return max(0.1, min(8.0, float(score_gap)))
+    return 1.0
+
+
+def _ranking_key(candidate):
+    return (
+        -float(candidate.get("score", 0.0)),
+        float(candidate.get("exec_time", 999.0)),
+        len(str(candidate.get("text", "") or "")),
+    )
+
+
+def _load_prompt_dataset(dataset_path, num_prompts):
+    full_ds = load_from_disk(dataset_path)
+    if isinstance(full_ds, DatasetDict):
+        if "train" in full_ds:
+            base = full_ds["train"]
+        else:
+            split_name = sorted(full_ds.keys())[0]
+            print(f"Info: DatasetDict without 'train'. Using split '{split_name}'.")
+            base = full_ds[split_name]
+    else:
+        base = full_ds
+    if len(base) == 0:
+        raise RuntimeError(f"Dataset '{dataset_path}' is empty.")
+    return base.select(range(min(num_prompts, len(base))))
+
 def generate_and_filter(
     model_path="qwen_sft_merged",
     dataset_path="./sota_slm_coding_dataset",
@@ -53,6 +101,9 @@ def generate_and_filter(
     min_dpo_pairs=50,
     dpo_min_score_gap=1.0,
     dpo_max_rejected_score=0.6,
+    dpo_negatives_per_prompt=3,
+    temperatures="0.2,0.8",
+    pair_weighting="score_gap",
     min_evaluated_candidates=4,
     generation_batch_size=64,
     max_prompt_chars=7000,
@@ -82,22 +133,12 @@ def generate_and_filter(
     )
     
     print("Loading prompt dataset...")
-    # Wir nehmen ein subset für Distillation
-    full_ds = load_from_disk(dataset_path)
-    if len(full_ds) == 0:
-        raise RuntimeError(f"Dataset '{dataset_path}' is empty.")
-    dataset = full_ds.select(range(min(num_prompts, len(full_ds))))
+    dataset = _load_prompt_dataset(dataset_path, num_prompts=num_prompts)
     
-    # N Generationen pro Prompt
+    # N Generationen pro Prompt und Temperatur.
     N = num_samples_per_prompt
-    sampling_params = SamplingParams(
-        n=N,
-        temperature=0.7, # Hohe Temperatur für Diversität
-        top_p=0.9,
-        max_tokens=1500,
-        stop=["<|im_end|>"],
-        seed=seed,
-    )
+    temperatures = _parse_temperatures(temperatures)
+    dpo_negatives_per_prompt = max(1, int(dpo_negatives_per_prompt))
     
     def _prompt_only(example):
         prompt = example.get("prompt")
@@ -112,117 +153,132 @@ def generate_and_filter(
     prompts = [_truncate_prompt(_prompt_only(example), max_prompt_chars=max_prompt_chars) for example in dataset]
     test_cases = [example.get("tests", "") or "" for example in dataset]
     
-    print(f"Generating {N} solutions for {len(prompts)} prompts. This might take a while...")
-    outputs = llm.generate(prompts, sampling_params)
-    
     distilled_data = []
     dpo_pairs = []
     skipped_without_tests = 0
     skipped_low_quality_tests = 0
     
     print("Evaluating generations in secure AST sandbox...")
-    for idx, output in enumerate(outputs):
-        tests = (test_cases[idx] or "").strip()
-        if not tests:
-            skipped_without_tests += 1
-            continue
-        test_quality = assess_test_quality(tests)
-        if not is_test_quality_sufficient(
-            tests,
-            min_asserts=min_test_asserts,
-            min_nonempty_lines=min_test_lines,
-            min_quality_score=min_test_quality_score,
-        ):
-            skipped_low_quality_tests += 1
-            continue
-
-        best_passing = None
-        best_non_perfect = None
-        evaluated_candidates = 0
-        
-        for completion in output.outputs:
-            text = completion.text
-            code = extract_xml_content(text, "answer")
-            if not code:
-                continue
-            
-            code = code.replace("```python", "").replace("```", "").strip()
-
-            verify = run_test_verifier(
-                code=code,
-                tests=tests,
-                timeout=timeout,
-                rounds=verifier_rounds,
-                require_all_pass=True,
+    generation_batch_size = max(1, int(generation_batch_size))
+    for start_idx in range(0, len(prompts), generation_batch_size):
+        end_idx = min(len(prompts), start_idx + generation_batch_size)
+        prompt_chunk = prompts[start_idx:end_idx]
+        print(
+            f"[Distill] Generating chunk {start_idx}-{end_idx - 1} "
+            f"({len(prompt_chunk)} prompts, {N} samples x {len(temperatures)} temps)..."
+        )
+        chunk_outputs_by_temp = []
+        for temp_idx, temp in enumerate(temperatures):
+            sampling_params = SamplingParams(
+                n=N,
+                temperature=temp,
+                top_p=0.9,
+                max_tokens=1500,
+                stop=["<|im_end|>"],
+                seed=seed + (temp_idx * 997) + start_idx,
             )
-            score = float(verify["score"])
-            exec_time = float(verify["exec_time"])
-            evaluated_candidates += 1
+            outputs = llm.generate(prompt_chunk, sampling_params)
+            chunk_outputs_by_temp.append((temp, outputs))
 
-            if score == 2.0:
-                if best_passing is None:
-                    best_passing = {
+        for local_idx in range(len(prompt_chunk)):
+            idx = start_idx + local_idx
+            tests = (test_cases[idx] or "").strip()
+            if not tests:
+                skipped_without_tests += 1
+                continue
+            test_quality = assess_test_quality(tests)
+            if not is_test_quality_sufficient(
+                tests,
+                min_asserts=min_test_asserts,
+                min_nonempty_lines=min_test_lines,
+                min_quality_score=min_test_quality_score,
+            ):
+                skipped_low_quality_tests += 1
+                continue
+
+            passing_candidates = []
+            non_passing_candidates = []
+            evaluated_candidates = 0
+
+            for temp, outputs in chunk_outputs_by_temp:
+                output = outputs[local_idx]
+                for completion in output.outputs:
+                    text = completion.text
+                    code = extract_xml_content(text, "answer")
+                    if not code:
+                        continue
+
+                    code = code.replace("```python", "").replace("```", "").strip()
+                    verify = run_test_verifier(
+                        code=code,
+                        tests=tests,
+                        timeout=timeout,
+                        rounds=verifier_rounds,
+                        require_all_pass=True,
+                    )
+                    score = float(verify["score"])
+                    exec_time = float(verify["exec_time"])
+                    evaluated_candidates += 1
+                    candidate = {
                         "text": text,
                         "score": score,
                         "exec_time": exec_time,
+                        "temperature": temp,
                     }
-                else:
-                    if (exec_time < best_passing["exec_time"]) or (
-                        exec_time == best_passing["exec_time"] and len(text) < len(best_passing["text"])
-                    ):
-                        best_passing = {
-                            "text": text,
-                            "score": score,
-                            "exec_time": exec_time,
-                        }
-                continue
-            if best_non_perfect is None:
-                best_non_perfect = {
-                    "text": text,
-                    "score": score,
-                    "exec_time": exec_time,
-                }
-            else:
-                if (score > best_non_perfect["score"]) or (
-                    score == best_non_perfect["score"] and exec_time < best_non_perfect["exec_time"]
-                ):
-                    best_non_perfect = {
-                        "text": text,
-                        "score": score,
-                        "exec_time": exec_time,
-                    }
-                
-        if best_passing:
-            distilled_prompt = prompts[idx] + best_passing["text"]
-            distilled_data.append(
-                {
-                    "text": distilled_prompt,
-                    "prompt": prompts[idx],
-                    "tests": test_cases[idx],
-                    "test_quality_score": test_quality["quality_score"],
-                    "test_assert_count": test_quality["assert_count"],
-                }
-            )
-            if best_non_perfect and evaluated_candidates >= min_evaluated_candidates:
-                score_gap = best_passing["score"] - best_non_perfect["score"]
-                if score_gap < dpo_min_score_gap:
-                    continue
-                if best_non_perfect["score"] > dpo_max_rejected_score:
-                    continue
-                dpo_pairs.append(
+                    if score == 2.0:
+                        passing_candidates.append(candidate)
+                    else:
+                        non_passing_candidates.append(candidate)
+
+            passing_candidates.sort(key=_ranking_key)
+            non_passing_candidates.sort(key=_ranking_key)
+            best_passing = passing_candidates[0] if passing_candidates else None
+
+            if best_passing:
+                distilled_prompt = prompts[idx] + best_passing["text"]
+                distilled_data.append(
                     {
+                        "text": distilled_prompt,
                         "prompt": prompts[idx],
-                        "chosen": best_passing["text"],
-                        "rejected": best_non_perfect["text"],
                         "tests": test_cases[idx],
                         "chosen_score": best_passing["score"],
-                        "rejected_score": best_non_perfect["score"],
-                        "score_gap": score_gap,
+                        "chosen_temperature": best_passing["temperature"],
                         "test_quality_score": test_quality["quality_score"],
                         "test_assert_count": test_quality["assert_count"],
-                        "num_evaluated": evaluated_candidates,
                     }
                 )
+                if non_passing_candidates and evaluated_candidates >= min_evaluated_candidates:
+                    selected_negatives = non_passing_candidates[:dpo_negatives_per_prompt]
+                    for rank_idx, negative in enumerate(selected_negatives, start=1):
+                        score_gap = best_passing["score"] - negative["score"]
+                        if score_gap < dpo_min_score_gap:
+                            continue
+                        if negative["score"] > dpo_max_rejected_score:
+                            continue
+                        dpo_pairs.append(
+                            {
+                                "prompt": prompts[idx],
+                                "chosen": best_passing["text"],
+                                "rejected": negative["text"],
+                                "tests": test_cases[idx],
+                                "chosen_score": best_passing["score"],
+                                "rejected_score": negative["score"],
+                                "chosen_temperature": best_passing["temperature"],
+                                "rejected_temperature": negative["temperature"],
+                                "score_gap": score_gap,
+                                "pair_weight": _compute_pair_weight(pair_weighting, score_gap),
+                                "pair_weighting": pair_weighting,
+                                "negative_rank": rank_idx,
+                                "test_quality_score": test_quality["quality_score"],
+                                "test_assert_count": test_quality["assert_count"],
+                                "num_evaluated": evaluated_candidates,
+                            }
+                        )
+
+        print(
+            f"[Distill] Progress: processed {end_idx}/{len(prompts)} prompts | "
+            f"perfect={len(distilled_data)} | dpo_pairs={len(dpo_pairs)}"
+        )
             
     print(f"Distillation complete. Kept {len(distilled_data)} perfect trajectories out of {len(prompts)}.")
     if skipped_without_tests:
@@ -278,7 +334,13 @@ if __name__ == "__main__":
     parser.add_argument("--min-dpo-pairs", type=int, default=50)
     parser.add_argument("--dpo-min-score-gap", type=float, default=1.0)
     parser.add_argument("--dpo-max-rejected-score", type=float, default=0.6)
+    parser.add_argument("--dpo-negatives-per-prompt", type=int, default=3)
+    parser.add_argument("--temperatures", default="0.2,0.8")
+    parser.add_argument("--pair-weighting", default="score_gap")
     parser.add_argument("--min-evaluated-candidates", type=int, default=4)
+    parser.add_argument("--generation-batch-size", type=int, default=64)
+    parser.add_argument("--max-prompt-chars", type=int, default=7000)
+    parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--allow-missing-dpo", action="store_true")
     args = parser.parse_args()
 
@@ -298,6 +360,12 @@ if __name__ == "__main__":
         min_dpo_pairs=args.min_dpo_pairs,
         dpo_min_score_gap=args.dpo_min_score_gap,
         dpo_max_rejected_score=args.dpo_max_rejected_score,
+        dpo_negatives_per_prompt=args.dpo_negatives_per_prompt,
+        temperatures=args.temperatures,
+        pair_weighting=args.pair_weighting,
         min_evaluated_candidates=args.min_evaluated_candidates,
+        generation_batch_size=args.generation_batch_size,
+        max_prompt_chars=args.max_prompt_chars,
+        seed=args.seed,
         require_dpo_pairs=not args.allow_missing_dpo,
     )

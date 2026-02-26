@@ -45,6 +45,16 @@ fi
 echo "[setup] Installing project dependencies..."
 python3 -m pip install -r requirements.txt
 
+echo "[setup] Installing SWE-bench harness tooling..."
+if ! python3 -m pip install swebench; then
+  echo "[setup] WARN: pip install swebench failed, trying GitHub source..."
+  python3 -m pip install git+https://github.com/SWE-bench/SWE-bench.git
+fi
+
+echo "[setup] Recommended runtime env for RTX 3090 / 24GB stability:"
+echo "  export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128"
+echo "  export VLLM_WORKER_MULTIPROC_METHOD=spawn"
+
 echo "[setup] Verifying critical imports..."
 python3 - <<'PY'
 import importlib
