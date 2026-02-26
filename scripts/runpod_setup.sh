@@ -93,3 +93,7 @@ print(f"[setup] CUDA device: {torch.cuda.get_device_name(0)}")
 PY
 
 echo "[setup] RunPod environment setup complete."
+if [[ -x "scripts/runpod_preflight.sh" ]]; then
+  echo "[setup] Running post-setup preflight..."
+  bash scripts/runpod_preflight.sh
+fi

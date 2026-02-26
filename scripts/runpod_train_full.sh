@@ -9,9 +9,14 @@ if ! command -v nvidia-smi >/dev/null 2>&1; then
   exit 1
 fi
 
+if [[ -x "scripts/runpod_preflight.sh" ]]; then
+  echo "[train] Running preflight checks..."
+  bash scripts/runpod_preflight.sh
+fi
+
 BASE_MODEL_NAME="Qwen/Qwen2.5-Coder-1.5B-Instruct"
 SEED="3407"
-RUN_TS="$(date -u +%Y%m%d_%H%M%S)"
+RUN_TS="${RUN_ID:-$(date -u +%Y%m%d_%H%M%S)}"
 MANIFEST_DIR="run_manifests/${RUN_TS}"
 mkdir -p "${MANIFEST_DIR}"
 
@@ -73,30 +78,33 @@ if [[ -n "${HF_TOKEN:-}" ]]; then
 fi
 
 echo "[train] Stage 0/13: baseline freeze + run manifest"
-{
-  echo "run_timestamp_utc=${RUN_TS}"
-  echo "base_model_name=${BASE_MODEL_NAME}"
-  echo "seed=${SEED}"
-  echo "gpu_name=${GPU_NAME}"
-  echo "gpu_mem_mb=${GPU_MEM_MB}"
-  echo "profile_sft_max_seq_len=${SFT_MAX_SEQ_LEN}"
-  echo "profile_p1b_generation_batch_size=${P1B_GEN_BATCH}"
-  echo "profile_grpo_max_seq_len=${GRPO_MAX_SEQ_LEN}"
-  echo "python_version=$(python3 --version 2>&1)"
-  echo "git_commit=$(git rev-parse HEAD 2>/dev/null || echo n/a)"
-  echo "git_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo n/a)"
-  python3 - <<'PY'
+if [[ -f "${MANIFEST_DIR}/run_manifest.txt" && -f "${MANIFEST_DIR}/baseline_eval_classic.json" && -f "${MANIFEST_DIR}/baseline_eval_agentic.json" && -f "${MANIFEST_DIR}/baseline_eval_classic_cases.jsonl" && -f "${MANIFEST_DIR}/baseline_eval_agentic_cases.jsonl" ]]; then
+  echo "[train] Stage 0 artifacts already exist for RUN_ID=${RUN_TS}; skipping baseline rerun."
+else
+  {
+    echo "run_timestamp_utc=${RUN_TS}"
+    echo "base_model_name=${BASE_MODEL_NAME}"
+    echo "seed=${SEED}"
+    echo "gpu_name=${GPU_NAME}"
+    echo "gpu_mem_mb=${GPU_MEM_MB}"
+    echo "profile_sft_max_seq_len=${SFT_MAX_SEQ_LEN}"
+    echo "profile_p1b_generation_batch_size=${P1B_GEN_BATCH}"
+    echo "profile_grpo_max_seq_len=${GRPO_MAX_SEQ_LEN}"
+    echo "python_version=$(python3 --version 2>&1)"
+    echo "git_commit=$(git rev-parse HEAD 2>/dev/null || echo n/a)"
+    echo "git_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo n/a)"
+    python3 - <<'PY'
 import hashlib
 path = "scripts/runpod_train_full.sh"
 with open(path, "rb") as f:
     digest = hashlib.sha256(f.read()).hexdigest()
 print(f"script_sha256={digest}")
 PY
-  echo "cuda_info_start"
-  nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader || true
-  echo "cuda_info_end"
-  echo "package_versions_start"
-  python3 - <<'PY'
+    echo "cuda_info_start"
+    nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader || true
+    echo "cuda_info_end"
+    echo "package_versions_start"
+    python3 - <<'PY'
 import importlib
 
 pkgs = [
@@ -116,37 +124,38 @@ for name in pkgs:
         version = f"missing:{exc}"
     print(f"{name}={version}")
 PY
-  echo "package_versions_end"
-} > "${MANIFEST_DIR}/run_manifest.txt"
+    echo "package_versions_end"
+  } > "${MANIFEST_DIR}/run_manifest.txt"
 
-python3 eval_pipeline.py \
-  --model-path "${BASE_MODEL_NAME}" \
-  --benchmarks livecodebench,bigcodebench_instruct,swebench_verified_subset,mbpp,humaneval \
-  --swebench-mode "${SWEBENCH_MODE}" \
-  --patch-strategies "${PATCH_STRATEGIES}" \
-  --max-model-len "${EVAL_MAX_MODEL_LEN}" \
-  --num-samples 100 \
-  --pass-k 4 \
-  --bootstrap-samples 1000 \
-  --seed "${SEED}" \
-  --case-log-path "${MANIFEST_DIR}/baseline_eval_classic_cases.jsonl" \
-  --json-output "${MANIFEST_DIR}/baseline_eval_classic.json"
+  python3 eval_pipeline.py \
+    --model-path "${BASE_MODEL_NAME}" \
+    --benchmarks livecodebench,bigcodebench_instruct,swebench_verified_subset,mbpp,humaneval \
+    --swebench-mode "${SWEBENCH_MODE}" \
+    --patch-strategies "${PATCH_STRATEGIES}" \
+    --max-model-len "${EVAL_MAX_MODEL_LEN}" \
+    --num-samples 100 \
+    --pass-k 4 \
+    --bootstrap-samples 1000 \
+    --seed "${SEED}" \
+    --case-log-path "${MANIFEST_DIR}/baseline_eval_classic_cases.jsonl" \
+    --json-output "${MANIFEST_DIR}/baseline_eval_classic.json"
 
-python3 eval_pipeline.py \
-  --model-path "${BASE_MODEL_NAME}" \
-  --benchmarks bigcodebench_instruct,livecodebench,mbpp \
-  --agentic \
-  --search-mode "${AGENT_SEARCH_MODE}" \
-  --beam-width "${AGENT_BEAM_WIDTH}" \
-  --max-model-len "${EVAL_MAX_MODEL_LEN}" \
-  --num-samples 100 \
-  --max-rounds 3 \
-  --n-candidates 8 \
-  --candidate-schedule 8,6,4 \
-  --bootstrap-samples 1000 \
-  --seed "${SEED}" \
-  --case-log-path "${MANIFEST_DIR}/baseline_eval_agentic_cases.jsonl" \
-  --json-output "${MANIFEST_DIR}/baseline_eval_agentic.json"
+  python3 eval_pipeline.py \
+    --model-path "${BASE_MODEL_NAME}" \
+    --benchmarks bigcodebench_instruct,livecodebench,mbpp \
+    --agentic \
+    --search-mode "${AGENT_SEARCH_MODE}" \
+    --beam-width "${AGENT_BEAM_WIDTH}" \
+    --max-model-len "${EVAL_MAX_MODEL_LEN}" \
+    --num-samples 100 \
+    --max-rounds 3 \
+    --n-candidates 8 \
+    --candidate-schedule 8,6,4 \
+    --bootstrap-samples 1000 \
+    --seed "${SEED}" \
+    --case-log-path "${MANIFEST_DIR}/baseline_eval_agentic_cases.jsonl" \
+    --json-output "${MANIFEST_DIR}/baseline_eval_agentic.json"
+fi
 
 [[ -f "${MANIFEST_DIR}/run_manifest.txt" ]] || { echo "[train] Missing run manifest."; exit 1; }
 [[ -f "${MANIFEST_DIR}/baseline_eval_classic.json" ]] || { echo "[train] Missing baseline classic report."; exit 1; }

@@ -128,6 +128,7 @@ Notes:
 ```bash
 cd /workspace/sota_slm_pipeline
 bash scripts/runpod_setup.sh
+bash scripts/runpod_preflight.sh
 bash scripts/runpod_train_full.sh
 ```
 
@@ -135,6 +136,15 @@ Optional:
 ```bash
 export HF_TOKEN=hf_xxx
 ```
+
+Spot-resume best practice:
+```bash
+export RUN_ID=run_20260226_a
+bash scripts/runpod_train_full.sh
+```
+
+If the pod is interrupted, start a new pod with the same volume and run again with the same `RUN_ID`.
+Stage 0 baseline artifacts are reused, and training stages continue from checkpoints (`resume_from_checkpoint=auto`).
 
 ---
 
