@@ -50,7 +50,22 @@ def _flags_from_command_tokens(tokens: List[str]) -> Set[str]:
 def _extract_declared_flags(py_file: Path) -> Set[str]:
     text = py_file.read_text(encoding="utf-8")
     pattern = re.compile(r"add_argument\(\s*['\"](--[a-zA-Z0-9\-]+)")
-    return set(pattern.findall(text))
+    declared = set(pattern.findall(text))
+    if declared:
+        return declared
+
+    # Wrapper support: resolve runpy module wrappers to canonical implementation file.
+    run_module_match = re.search(r'run_module\(\s*["\']([a-zA-Z0-9_\.]+)["\']', text)
+    if not run_module_match:
+        return declared
+
+    module_name = run_module_match.group(1)
+    target = ROOT / (module_name.replace(".", "/") + ".py")
+    if not target.exists():
+        return declared
+
+    target_text = target.read_text(encoding="utf-8")
+    return set(pattern.findall(target_text))
 
 
 def main() -> int:

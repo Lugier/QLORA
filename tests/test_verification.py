@@ -38,7 +38,7 @@ class VerificationTests(unittest.TestCase):
     def test_fractional_fallback_from_round_scores(self):
         code = "def add(a, b):\n    return a + b\n"
         tests = "assert add(1, 2) == 3\nassert add(2, 2) == 5"
-        with patch("verification._instrument_tests_for_fractional_counts", return_value=""):
+        with patch("pipeline.core.verification._instrument_tests_for_fractional_counts", return_value=""):
             result = run_test_verifier(code=code, tests=tests, rounds=1, timeout=1.5, require_all_pass=True)
         self.assertEqual(result["fractional_mode"], "fallback_round_scores")
         self.assertGreater(result["pass_fraction"], 0.0)
@@ -62,7 +62,7 @@ class VerificationTests(unittest.TestCase):
         }
 
         # First run times out; retry should recover.
-        with patch("verification.run_code_in_sandbox_detailed", side_effect=[timeout_result, success_result, success_result]):
+        with patch("pipeline.core.verification.run_code_in_sandbox_detailed", side_effect=[timeout_result, success_result, success_result]):
             result = run_test_verifier(
                 code=code,
                 tests=tests,

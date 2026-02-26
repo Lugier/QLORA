@@ -1,167 +1,160 @@
-# SOTA SLM Pipeline (RunPod-Ready, Coder-First 1.5B)
+# QLORA Coding Model Pipeline (RunPod Ready)
 
-Production stack for a compact coding model with fixed base checkpoint:
+This repository trains a compact coding model (1.5B) to become a strong software-engineering assistant.
 
-- Base model (fixed): `Qwen/Qwen2.5-Coder-1.5B-Instruct`
-- No A/B branch
-- Spot-safe checkpoint/resume
-- Fail-fast artifact gates
-- SWE harness-first evaluation
+Base model:
+- `Qwen/Qwen2.5-Coder-1.5B-Instruct`
 
-## Implemented Upgrades
+## What This Project Does (Non-Technical)
 
-1. Real SWE harness as primary eval target (not only proxy).
-2. Online hard-example mining from real evaluation failures.
-3. Combined PRM + outcome reward profile (`prm_outcome_v1`) in GRPO.
-4. Tool-use trajectory distillation from agentic histories.
-5. Search-time compute for inference/eval (`greedy|beam|mcts`) with verifier-aware reranking.
-6. Two-dimensional curriculum (`core_code` -> `repo_resolution`) with difficulty sub-stages.
-7. Priority-source replay upsampling for hard mined + trajectory data.
-8. Dedicated `swe_supervised_dataset` path (Issue/Patch/Tests/Trajectory metadata).
-9. ORPO reference-free preference stage before GRPO.
-10. Tiny trainable PRM (`scripts/train_prm_tiny.py`) integrated into GRPO reward.
-11. Iterative hard-mining cycles (`HARD_MINING_CYCLES`) with failure-cluster replay.
-12. Private holdout benchmark support (`private_holdout`) with CI-aware acceptance gates.
-13. Scientific acceptance gate with paired significance testing on case-level logs.
-14. Dataset manifests (`dataset_manifest.json`) with split fingerprints and provenance metadata.
-15. Seeded deterministic evaluation sampling for reproducible case-level comparisons.
+Think of this as a 13-step bootcamp for an AI coder:
 
-## RunPod Quickstart
+1. We test the raw model first (baseline).
+2. We prepare high-quality training data.
+3. We teach formatting and coding fundamentals.
+4. We teach preference between better/worse answers.
+5. We strengthen behavior with reinforcement learning.
+6. We repeatedly test, collect failures, and retrain on hard cases.
+7. We only accept the run if strict quality/statistics gates pass.
+
+Goal:
+- Better real coding performance
+- Better repo bug-fixing behavior
+- Lower format mistakes
+- Reproducible, auditable training runs
+
+---
+
+## End-to-End Flow (What Happens, When, and Why)
+
+### Stage 0: Baseline Freeze
+- What: Evaluate the start model and save environment + run manifest.
+- Why: We need a trustworthy before/after comparison.
+
+### Stage 1: Data Pipeline
+- What: Build curated datasets, deduplicate, split into train/validation/holdout.
+- Why: Data quality drives model quality.
+
+### Stage 2: SFT (Supervised Fine-Tuning)
+- What: Teach clean structure and coding behavior on curated examples.
+- Why: Gives stable foundation before preference/RL stages.
+
+### Stage 3: Best-of-N + Pair Mining
+- What: Generate many candidates and keep high-quality outcomes + preference pairs.
+- Why: Converts raw generation into stronger training signals.
+
+### Stage 4: DPO
+- What: Train on chosen vs rejected responses.
+- Why: Better alignment with preferred coding style/outcomes.
+
+### Stage 5: ORPO
+- What: Additional preference optimization stage.
+- Why: Stabilizes policy before RL.
+
+### Stage 6: GRPO (Reinforcement Learning)
+- What: Curriculum RL using execution rewards, process rewards, and penalties.
+- Why: Improves real solve-rate under tests and constraints.
+
+### Stage 7-8: Pre-Replay Evaluation
+- What: Run benchmark evaluations and collect detailed case logs.
+- Why: Identify concrete weaknesses before replay training.
+
+### Stage 9: Hard Example + Trajectory Mining
+- What: Build hard replay dataset and tool-use trajectory dataset from failures.
+- Why: Train directly on what the model currently gets wrong.
+
+### Stage 9.5: Tiny PRM Training
+- What: Train a compact process-reward helper model from real logs.
+- Why: Better process-level reward shaping.
+
+### Stage 10: Hard Replay RL
+- What: Short focused RL pass on hardest cases.
+- Why: Push performance on difficult SWE patterns.
+
+### Stage 11-12: Final Evaluation + Export
+- What: Final benchmark run and model export.
+- Why: Produce deployable artifacts with validated quality.
+
+### Stage 13: Scientific Acceptance Gate
+- What: CI/statistical checks, no-regression checks, and quality thresholds.
+- Why: Prevent false wins and ensure robust improvements.
+
+---
+
+## Repository Structure
+
+```text
+sota_slm_pipeline/
+├── pipeline/
+│   ├── core/                      # Shared runtime/reward/verification logic
+│   │   ├── rewards.py
+│   │   ├── verification.py
+│   │   ├── runtime_agent.py
+│   │   ├── sandbox.py
+│   │   └── prm_tiny.py
+│   ├── stages/                    # Main training/eval stage implementations
+│   │   ├── data_pipeline.py
+│   │   ├── phase1_sft.py
+│   │   ├── phase1b_rejection_sampling.py
+│   │   ├── phase1c_dpo.py
+│   │   ├── phase1d_orpo.py
+│   │   ├── phase2_grpo.py
+│   │   ├── eval_pipeline.py
+│   │   └── export.py
+│   ├── docs/
+│   └── config/
+├── scripts/                       # RunPod orchestration + utilities
+│   ├── runpod_setup.sh
+│   ├── runpod_train_full.sh
+│   ├── build_hard_examples.py
+│   ├── build_tool_trajectories.py
+│   ├── train_prm_tiny.py
+│   ├── scientific_gate.py
+│   └── validate_cli_drift.py
+├── tests/                         # Unit/regression tests
+├── docs/
+│   └── SCIENTIFIC_PROTOCOL.md
+└── *.py                           # Backward-compatible wrappers (legacy entrypoints)
+```
+
+Notes:
+- Root-level `*.py` files are compatibility wrappers so old commands still work.
+- New canonical implementation lives under `pipeline/core` and `pipeline/stages`.
+
+---
+
+## Quick Start (RunPod)
 
 ```bash
 cd /workspace/sota_slm_pipeline
 bash scripts/runpod_setup.sh
+bash scripts/runpod_train_full.sh
 ```
 
-Optional for gated datasets:
-
+Optional:
 ```bash
 export HF_TOKEN=hf_xxx
 ```
 
-Run full production pipeline:
+---
 
-```bash
-bash scripts/runpod_train_full.sh
-```
+## What “Success” Means
 
-Default RunPod profile is tuned for RTX 3090 / 24GB:
+The run is accepted only if strict gates pass, including:
+- low format error rate
+- significant improvement over baseline
+- no major benchmark regressions
+- complete artifacts + manifests
 
-- SFT/GRPO `max_seq_length=6144`
-- conservative generation batch in Phase 1b
-- allocator settings for long-run stability
+Scientific details:
+- see `docs/SCIENTIFIC_PROTOCOL.md`
 
-## Full Flow (13 stages)
+---
 
-1. Stage 0: baseline freeze + run manifest.
-2. Stage 1: contamination-safe data build + dedicated SWE supervised build.
-3. Stage 2: SFT with coder base + LoRA (`r=48`, `alpha=96`, `dropout=0.03`) using merged dataset paths.
-4. Stage 3: best-of-N + hardened DPO pair mining (multi-temp, multi-negative).
-5. Stage 4: DPO with gap-weighting, max-pairs guard, resume-safe checkpoints.
-6. Stage 5: ORPO reference-free preference refinement.
-7. Stage 6: GRPO curriculum with `prm_outcome_v1` reward.
-8. Stage 7-8: pre-replay classic/agentic eval (+ case logs).
-9. Stage 9: hard-example mining + trajectory distillation.
-10. Stage 9.5: train tiny PRM on real run failures.
-11. Stage 10: hard-replay GRPO pass (+ optional iterative cycles).
-12. Stage 11-12: final eval (incl. private holdout) + export.
-13. Stage 13: strict CI-aware acceptance gates.
+## For External Readers
 
-## Key Scripts
-
-- `scripts/runpod_setup.sh`
-- `scripts/runpod_train_full.sh`
-- `scripts/build_hard_examples.py`
-- `scripts/build_tool_trajectories.py`
-- `scripts/train_prm_tiny.py`
-- `scripts/validate_cli_drift.py`
-- `scripts/scientific_gate.py`
-
-## Core CLI Knobs
-
-### Eval Harness + Search
-
-```bash
-python3 eval_pipeline.py \
-  --model-path qwen_grpo_final \
-  --benchmarks livecodebench,bigcodebench_instruct,swebench_verified_subset,mbpp,humaneval,private_holdout \
-  --swebench-mode harness \
-  --private-holdout-path ./sota_slm_coding_dataset \
-  --patch-strategies minimal_diff,api_first,test_first,balanced \
-  --search-mode beam \
-  --beam-width 2 \
-  --bootstrap-samples 2000
-```
-
-### GRPO Reward Profile
-
-```bash
-python3 phase2_grpo.py \
-  --base-model-name Qwen/Qwen2.5-Coder-1.5B-Instruct \
-  --curriculum-mode two_dimensional_v1 \
-  --priority-source-boost 1.8 \
-  --priority-sources online_hard_mining,tool_trajectory_distill \
-  --reward-profile prm_outcome_v1 \
-  --prm-model-path ./artifacts/prm_tiny_v1.json \
-  --stage-drop-fractions easy:0.15,mid:0.10,hard:0.05,expert:0.03 \
-  --hard-replay-dataset ./sota_hard_examples_dataset
-```
-
-### Distillation Mining
-
-```bash
-python3 phase1b_rejection_sampling.py \
-  --temperatures 0.2,0.8 \
-  --dpo-negatives-per-prompt 3 \
-  --pair-weighting score_gap
-```
-
-### ORPO
-
-```bash
-python3 phase1d_orpo.py \
-  --dpo-dataset-path ./sota_dpo_pairs_dataset \
-  --adapter-path qwen_dpo_lora \
-  --output-model-dir qwen_orpo_lora
-```
-
-## Acceptance Gates
-
-`scripts/runpod_train_full.sh` enforces:
-
-- `format_error_rate < 2%`
-- `>= +15%` relative primary objective improvement vs baseline
-- per-benchmark no-regression on `pass@1` and `format_error_rate` (small CI tolerance)
-- mandatory artifacts for every stage (no empty "success")
-
-## Important Artifacts
-
-- `run_manifests/<timestamp>/run_manifest.txt`
-- `run_manifests/<timestamp>/baseline_eval_classic.json`
-- `run_manifests/<timestamp>/baseline_eval_agentic.json`
-- `run_manifests/<timestamp>/pre_replay_eval_*.json`
-- `run_manifests/<timestamp>/posttrain_eval_*.json`
-- `run_manifests/<timestamp>/*_cases.jsonl`
-- `run_manifests/<timestamp>/scientific_acceptance.json`
-- `sota_slm_coding_dataset`
-- `sota_slm_coding_dataset/dataset_manifest.json`
-- `sota_best_of_n_dataset`
-- `sota_dpo_pairs_dataset`
-- `swe_supervised_dataset`
-- `swe_supervised_dataset/dataset_manifest.json`
-- `sota_hard_examples_dataset`
-- `sota_tool_trajectory_dataset`
-- `artifacts/prm_tiny_v1.json`
-- `qwen_sft_lora`, `qwen_sft_merged`, `qwen_dpo_lora`, `qwen_orpo_lora`, `qwen_grpo_lora`, `qwen_grpo_final`
-- `model_export_gguf`, `model_export_hf`
-
-## Notes
-
-- In `--swebench-mode harness`, eval fails hard if harness execution fails.
-- In `--swebench-mode auto`, eval falls back to proxy scoring only if harness fails.
-- `STRICT_SWEBENCH_HARNESS=1` enforces harness-only operation for primary runs.
-- You can increase iterative failure replay via `HARD_MINING_CYCLES` (default `2`).
-- Trajectory distillation uses successful trajectories by default (failed final states are excluded).
-- Keep seed fixed (`3407`) for high reproducibility across stages.
-- Final eval reuses baseline case IDs (`--case-id-filter-path`) for paired significance tests.
-- See scientific methodology and references: `docs/SCIENTIFIC_PROTOCOL.md`.
+If you are new:
+1. Read this README first.
+2. Read `docs/SCIENTIFIC_PROTOCOL.md` for evaluation rigor.
+3. Run `scripts/runpod_train_full.sh` for the full pipeline.
+4. Inspect `run_manifests/<timestamp>/` for reports and audit trail.
