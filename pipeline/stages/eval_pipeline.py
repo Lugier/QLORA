@@ -638,7 +638,8 @@ def _evaluate_classic_case(
         "pass_at_1": bool(pass_flags[0]) if pass_flags else False,
         "pass_at_k": any(pass_flags),
         "format_errors": format_errors,
-        "generated_candidates": max(1, pass_k),
+        # Use actual generated candidate count for correct format-error normalization.
+        "generated_candidates": max(1, len(candidates)),
         "rounds_used": 1,
         "best_code": best_code,
     }
@@ -885,7 +886,8 @@ def generate_and_evaluate(
                     "pass_at_1": False,
                     "pass_at_k": False,
                     "format_errors": 0,
-                    "generated_candidates": max(1, pass_k),
+                    # Harness mode evaluates one final patch per case.
+                    "generated_candidates": 1,
                     "rounds_used": 1,
                     "best_patch": "",
                 }
@@ -1045,6 +1047,7 @@ def generate_and_evaluate(
                     case_log["pass_at_1"] = bool(passed)
                     case_log["pass_at_k"] = bool(passed)
                     case_log["format_errors"] = 1 if not pred_patch else 0
+                    case_log["generated_candidates"] = 1
                     case_log["resolve_proxy"] = sim
             else:
                 resolved = set(harness_result.get("resolved_ids", []))
@@ -1061,6 +1064,7 @@ def generate_and_evaluate(
                     case_log["pass_at_1"] = bool(pass1_values[idx])
                     case_log["pass_at_k"] = bool(passk_values[idx])
                     case_log["format_errors"] = format_errors_for_case
+                    case_log["generated_candidates"] = 1
 
         # Build global records after any harness-backed overrides so report groups stay consistent.
         for case_idx in case_log_indices:
