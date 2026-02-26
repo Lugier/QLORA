@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from verification import assess_test_quality, is_test_quality_sufficient, run_test_verifier
 
@@ -33,6 +34,46 @@ class VerificationTests(unittest.TestCase):
         result = run_test_verifier(code=code, tests=tests, rounds=1, timeout=1.5, require_all_pass=True)
         self.assertFalse(result["all_passed"])
         self.assertIn("security", result["error_counts"])
+
+    def test_fractional_fallback_from_round_scores(self):
+        code = "def add(a, b):\n    return a + b\n"
+        tests = "assert add(1, 2) == 3\nassert add(2, 2) == 5"
+        with patch("verification._instrument_tests_for_fractional_counts", return_value=""):
+            result = run_test_verifier(code=code, tests=tests, rounds=1, timeout=1.5, require_all_pass=True)
+        self.assertEqual(result["fractional_mode"], "fallback_round_scores")
+        self.assertGreater(result["pass_fraction"], 0.0)
+
+    def test_timeout_retry_recovers_score(self):
+        code = "def mul(a, b):\n    return a * b\n"
+        tests = "assert mul(2, 3) == 6"
+        timeout_result = {
+            "score": -0.5,
+            "exec_time": 1.0,
+            "stdout": "",
+            "stderr": "Execution timed out.",
+            "error_type": "timeout",
+        }
+        success_result = {
+            "score": 2.0,
+            "exec_time": 0.2,
+            "stdout": "",
+            "stderr": "",
+            "error_type": "",
+        }
+
+        # First run times out; retry should recover.
+        with patch("verification.run_code_in_sandbox_detailed", side_effect=[timeout_result, success_result, success_result]):
+            result = run_test_verifier(
+                code=code,
+                tests=tests,
+                rounds=1,
+                timeout=1.0,
+                require_all_pass=True,
+                retry_on_timeout=True,
+                timeout_retry_factor=1.5,
+            )
+        self.assertTrue(result["all_passed"])
+        self.assertEqual(result["score"], 2.0)
 
 
 if __name__ == "__main__":

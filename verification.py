@@ -213,12 +213,70 @@ def _fractional_assert_execution(code: str, tests: str, timeout: float = 2.0) ->
     }
 
 
+def _score_to_fraction(score: float, error_type: str) -> float:
+    if score >= 1.99:
+        return 1.0
+    normalized = str(error_type or "").strip().lower()
+    if normalized == "assertion":
+        return 0.45
+    if normalized in {"runtime", "syntax"}:
+        return 0.1
+    if normalized in {"timeout", "security"}:
+        return 0.0
+    if score >= 0.5:
+        return 0.35
+    if score > 0.0:
+        return 0.15
+    return 0.0
+
+
+def _fallback_fraction_from_rounds(details: List[Dict[str, object]], quality_assert_count: int) -> Dict[str, object]:
+    if not details:
+        return {
+            "assert_passed": 0,
+            "assert_total": max(1, int(quality_assert_count)),
+            "pass_fraction": 0.0,
+            "fractional_mode": "fallback_round_scores",
+        }
+    estimates = []
+    for detail in details:
+        score = float(detail.get("score", 0.0))
+        err = str(detail.get("error_type", "") or "")
+        estimates.append(_score_to_fraction(score=score, error_type=err))
+    pass_fraction = sum(estimates) / max(1, len(estimates))
+    assert_total = max(1, int(quality_assert_count))
+    assert_passed = int(round(pass_fraction * assert_total))
+    return {
+        "assert_passed": max(0, min(assert_passed, assert_total)),
+        "assert_total": assert_total,
+        "pass_fraction": max(0.0, min(1.0, pass_fraction)),
+        "fractional_mode": "fallback_round_scores",
+    }
+
+
+def _run_single_seed(code: str, tests: str, seed: int, timeout: float, retry_on_timeout: bool, timeout_retry_factor: float):
+    eval_code = _compose_eval_code(code, tests, seed=seed)
+    result = run_code_in_sandbox_detailed(eval_code, timeout=timeout)
+    if retry_on_timeout and str(result.get("error_type", "") or "") == "timeout":
+        extended_timeout = max(timeout * max(1.0, timeout_retry_factor), timeout + 0.25)
+        retry = run_code_in_sandbox_detailed(eval_code, timeout=extended_timeout)
+        if float(retry.get("score", 0.0)) > float(result.get("score", 0.0)):
+            retry["retry_used"] = True
+            retry["retry_from_timeout"] = True
+            retry["retry_base_timeout"] = timeout
+            retry["retry_timeout"] = extended_timeout
+            return retry
+    return result
+
+
 def run_test_verifier(
     code: str,
     tests: str,
     timeout: float = 2.0,
     rounds: int = 2,
     require_all_pass: bool = True,
+    retry_on_timeout: bool = True,
+    timeout_retry_factor: float = 1.5,
 ) -> Dict[str, object]:
     normalized_tests = (tests or "").strip()
     if not normalized_tests:
@@ -243,8 +301,14 @@ def run_test_verifier(
     error_counts: Dict[str, int] = {}
 
     for seed in range(rounds):
-        eval_code = _compose_eval_code(code, normalized_tests, seed=seed)
-        result = run_code_in_sandbox_detailed(eval_code, timeout=timeout)
+        result = _run_single_seed(
+            code=code,
+            tests=normalized_tests,
+            seed=seed,
+            timeout=timeout,
+            retry_on_timeout=retry_on_timeout,
+            timeout_retry_factor=timeout_retry_factor,
+        )
         details.append(result)
         score = float(result.get("score", 0.0))
         scores.append(score)
@@ -273,10 +337,22 @@ def run_test_verifier(
         ),
     )[0]
 
+    quality = assess_test_quality(normalized_tests)
     fractional = _fractional_assert_execution(code=code, tests=normalized_tests, timeout=timeout)
     pass_fraction = float(fractional.get("pass_fraction", 0.0))
     assert_passed = int(fractional.get("assert_passed", 0))
     assert_total = int(fractional.get("assert_total", 0))
+    fractional_mode = "instrumented"
+
+    if assert_total == 0:
+        fallback = _fallback_fraction_from_rounds(
+            details=details,
+            quality_assert_count=int(quality.get("assert_count", 0)),
+        )
+        pass_fraction = max(pass_fraction, float(fallback["pass_fraction"]))
+        assert_total = int(fallback["assert_total"])
+        assert_passed = int(fallback["assert_passed"])
+        fractional_mode = str(fallback["fractional_mode"])
 
     if assert_total == 0 and all_passed:
         pass_fraction = 1.0
@@ -291,6 +367,7 @@ def run_test_verifier(
         "pass_fraction": pass_fraction,
         "assert_passed": assert_passed,
         "assert_total": assert_total,
+        "fractional_mode": fractional_mode,
         "error_counts": error_counts,
-        "quality": assess_test_quality(normalized_tests),
+        "quality": quality,
     }

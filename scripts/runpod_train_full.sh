@@ -373,7 +373,7 @@ python3 phase2_grpo.py \
   --drop-low-quality-fraction 0.05 \
   --stage-drop-fractions easy:0.08,mid:0.06,hard:0.04,expert:0.02 \
   --curriculum-mode two_dimensional_v1 \
-  --priority-source-boost 2.0 \
+  --priority-source-boost 1.6 \
   --priority-sources online_hard_mining,tool_trajectory_distill \
   --reward-profile prm_outcome_v1 \
   --prm-model-path "${PRM_MODEL_PATH}" \
@@ -473,7 +473,7 @@ if [[ "${HARD_MINING_CYCLES}" =~ ^[0-9]+$ ]] && [[ "${HARD_MINING_CYCLES}" -gt 1
       --drop-low-quality-fraction 0.04 \
       --stage-drop-fractions easy:0.08,mid:0.06,hard:0.04,expert:0.02 \
       --curriculum-mode two_dimensional_v1 \
-      --priority-source-boost 2.1 \
+      --priority-source-boost 1.8 \
       --priority-sources online_hard_mining,tool_trajectory_distill \
       --reward-profile prm_outcome_v1 \
       --prm-model-path "${PRM_PATH_CYCLE}" \

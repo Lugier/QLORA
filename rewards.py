@@ -75,7 +75,8 @@ def _completion_to_text(completion):
 def get_aero_weights():
     progress = min(1.0, AERO_GLOBAL_STEP / max(1.0, float(AERO_MAX_STEPS)))
     format_weight = max(0.1, 1.0 - progress)
-    exec_weight = 1.0 + (1.5 * progress)
+    # Keep execution pressure strong, but avoid making format failures economically attractive.
+    exec_weight = 1.0 + (1.0 * progress)
     return format_weight, exec_weight
 
 
@@ -97,20 +98,34 @@ def strict_format_reward_func(prompts: List[str], completions: List[Dict[str, st
     return rewards
 
 
+def _estimate_case_complexity(prompt: str, tests: str) -> float:
+    prompt_len = len((prompt or "").split())
+    test_asserts = len(re.findall(r"\bassert\b", tests or ""))
+    score = (
+        (0.6 * min(1.0, prompt_len / 600.0))
+        + (0.4 * min(1.0, test_asserts / 8.0))
+    )
+    return max(0.0, min(1.0, score))
+
+
 def length_penalty_reward_func(prompts, completions, answer, **kwargs):
     rewards = []
     responses = [_completion_to_text(comp) for comp in completions]
 
-    for resp in responses:
+    for prompt, resp, tests in zip(prompts, responses, answer):
         tokens = len(resp.split())
-        if tokens < 300:
+        complexity = _estimate_case_complexity(str(prompt or ""), str(tests or ""))
+        # Harder repo-like cases get a looser verbosity budget.
+        soft = int(280 + (620 * complexity))
+        hard = int(700 + (1300 * complexity))
+        if tokens < soft:
             rewards.append(0.0)
-        elif tokens < 600:
+        elif tokens < hard:
             rewards.append(-0.2)
-        elif tokens < 1000:
+        elif tokens < hard + 300:
             rewards.append(-0.5)
         else:
-            penalty = max(-2.0, -0.5 - ((tokens - 1000) * 0.001))
+            penalty = max(-2.0, -0.5 - ((tokens - (hard + 300)) * 0.001))
             rewards.append(penalty)
     return rewards
 
@@ -154,6 +169,45 @@ def _tiny_prm_score(prompt: str, reasoning: str, extracted_answer: str, tests: s
         return float(predict_tiny_prm(_PRM_TINY_MODEL, record))
     except Exception:
         return 0.5
+
+
+def _reasoning_structure_score(reasoning: str, prompt: str, tests: str) -> float:
+    if not reasoning:
+        return -0.05
+    reasoning_l = reasoning.lower()
+    lines = [line.strip() for line in reasoning.splitlines() if line.strip()]
+    words = reasoning.split()
+
+    score = 0.0
+    if len(lines) >= 2:
+        score += 0.08
+    if any(token in reasoning_l for token in ["because", "therefore", "so that", "hence"]):
+        score += 0.07
+    if any(token in reasoning_l for token in ["first", "second", "then", "finally", "step"]):
+        score += 0.08
+
+    identifier_hits = 0
+    identifiers = set(re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]{2,}\b", (prompt or "") + "\n" + (tests or "")))
+    if identifiers:
+        reasoning_ids = set(re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]{2,}\b", reasoning))
+        identifier_hits = len(identifiers.intersection(reasoning_ids))
+    if identifier_hits >= 2:
+        score += 0.07
+
+    if words:
+        unique_ratio = len(set(w.lower() for w in words)) / max(1, len(words))
+        if unique_ratio < 0.35:
+            # Penalize low-diversity keyword stuffing / repeated buzzwords.
+            score -= 0.12
+
+    return score
+
+
+def _adaptive_verifier_timeout(prompt: str, tests: str) -> float:
+    complexity = _estimate_case_complexity(prompt=prompt, tests=tests)
+    # Extend timeout for long-context/high-assert tasks to reduce noisy false timeouts.
+    timeout = 2.0 + (1.5 * complexity)
+    return max(1.5, min(4.0, timeout))
 
 
 def process_reward_func(prompts, completions, answer, **kwargs):
@@ -210,6 +264,12 @@ def process_reward_func(prompts, completions, answer, **kwargs):
         else:
             score -= 0.10
 
+        score += _reasoning_structure_score(
+            reasoning=str(reasoning or ""),
+            prompt=str(prompt or ""),
+            tests=expected_tests,
+        )
+
         if not extracted_answer:
             score -= 0.20
         else:
@@ -255,7 +315,7 @@ def execution_reward_func(prompts: List[str], completions: List[Dict[str, str]],
     rewards = []
     responses = [_completion_to_text(comp) for comp in completions]
 
-    for resp, expected_tests in zip(responses, answer):
+    for prompt, resp, expected_tests in zip(prompts, responses, answer):
         expected_tests = (expected_tests or "").strip()
         if not expected_tests:
             rewards.append(0.0)
@@ -263,16 +323,19 @@ def execution_reward_func(prompts: List[str], completions: List[Dict[str, str]],
 
         extracted_code = extract_xml_content(resp, "answer")
         if not extracted_code:
-            rewards.append(-2.0)
+            rewards.append(-3.0)
             continue
 
         code_snippet = extracted_code.replace("```python", "").replace("```", "").strip()
+        verifier_timeout = _adaptive_verifier_timeout(prompt=str(prompt or ""), tests=expected_tests)
         verify = run_test_verifier(
             code=code_snippet,
             tests=expected_tests,
-            timeout=2.0,
+            timeout=verifier_timeout,
             rounds=1,
             require_all_pass=True,
+            retry_on_timeout=True,
+            timeout_retry_factor=1.5,
         )
 
         all_passed = bool(verify.get("all_passed", False))
@@ -292,7 +355,7 @@ def execution_reward_func(prompts: List[str], completions: List[Dict[str, str]],
             score = max(-0.2, 1.4 * pass_fraction)
             score += _error_penalty(error_type)
 
-        score = max(-3.0, min(4.0, score * exec_weight))
+        score = max(-3.0, min(3.5, score * exec_weight))
         rewards.append(score)
 
     return rewards

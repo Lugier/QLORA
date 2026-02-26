@@ -38,14 +38,15 @@ class EMACheckpointCallback(TrainerCallback):
     EMA stabilization in the late phase to reduce RL drift.
     """
 
-    def __init__(self, model, max_steps, decay=0.999):
+    def __init__(self, model, max_steps, decay=0.9995, start_fraction=0.30):
         self.ema_model_weights = None
         self.model = model
         self.decay = decay
         self.trainable_param_names = {
             name for name, param in self.model.named_parameters() if param.requires_grad
         }
-        self.start_ema_step = int(max_steps * 0.7)
+        start_fraction = max(0.05, min(0.95, float(start_fraction)))
+        self.start_ema_step = int(max_steps * start_fraction)
 
     def on_step_end(self, args, state, control, **kwargs):
         if state.global_step < self.start_ema_step:
@@ -403,7 +404,28 @@ def _build_grpo_config(**kwargs):
     return GRPOConfig(**supported)
 
 
-def _build_training_args(stage_steps, stage_name, seed, stage_output_dir, checkpoint_every_steps):
+def _stage_context_lengths(stage_name: str, max_seq_length: int):
+    stage_name = (stage_name or "").lower()
+    max_seq_length = max(1024, int(max_seq_length))
+    long_context = any(token in stage_name for token in ["repo", "hard", "expert", "replay"])
+
+    if long_context:
+        prompt_target = 3072
+        completion_target = 2048
+    else:
+        prompt_target = 1536
+        completion_target = 1400
+
+    # Keep prompt+completion safely inside available context budget.
+    budget = max(1024, max_seq_length - 256)
+    prompt_len = min(prompt_target, max(512, budget - 1024))
+    completion_len = min(completion_target, max(512, budget - prompt_len))
+    if prompt_len + completion_len > budget:
+        completion_len = max(512, budget - prompt_len)
+    return int(prompt_len), int(completion_len)
+
+
+def _build_training_args(stage_steps, stage_name, seed, stage_output_dir, checkpoint_every_steps, max_seq_length):
     stage_name = (stage_name or "").lower()
     if stage_name == "hard_replay":
         lr = 3e-6
@@ -424,6 +446,8 @@ def _build_training_args(stage_steps, stage_name, seed, stage_output_dir, checkp
         lr = 4e-6
         num_generations = 6
 
+    max_prompt_length, max_completion_length = _stage_context_lengths(stage_name, max_seq_length=max_seq_length)
+
     return _build_grpo_config(
         output_dir=stage_output_dir,
         weight_decay=0.1,
@@ -434,8 +458,8 @@ def _build_training_args(stage_steps, stage_name, seed, stage_output_dir, checkp
         per_device_train_batch_size=2,
         gradient_accumulation_steps=4,
         num_generations=num_generations,
-        max_prompt_length=512,
-        max_completion_length=1500,
+        max_prompt_length=max_prompt_length,
+        max_completion_length=max_completion_length,
         fp16=not torch.cuda.is_bfloat16_supported(),
         bf16=torch.cuda.is_bfloat16_supported(),
         optim="adamw_8bit",
@@ -703,8 +727,9 @@ def train_grpo(
             seed=seed,
             stage_output_dir=stage_output_dir,
             checkpoint_every_steps=checkpoint_every_steps,
+            max_seq_length=max_seq_length,
         )
-        callbacks = [EMACheckpointCallback(model, max_steps=stage_steps)] if idx == len(stage_plan) - 1 else []
+        callbacks = [EMACheckpointCallback(model, max_steps=stage_steps, decay=0.9995, start_fraction=0.30)] if idx == len(stage_plan) - 1 else []
         trainer = _build_trainer(
             model=model,
             tokenizer=tokenizer,
@@ -748,6 +773,7 @@ def train_grpo(
             seed=seed,
             stage_output_dir=replay_output_dir,
             checkpoint_every_steps=checkpoint_every_steps,
+            max_seq_length=max_seq_length,
         )
         replay_trainer = _build_trainer(
             model=model,
