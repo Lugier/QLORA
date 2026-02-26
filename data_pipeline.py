@@ -634,6 +634,58 @@ def _is_answer_ast_parseable(text):
         return False
 
 
+def _looks_like_patch(answer: str) -> bool:
+    answer = (answer or "").strip()
+    if not answer:
+        return False
+    lowered = answer.lower()
+    return (
+        "diff --git" in lowered
+        or ("\n@@" in answer and ("\n+" in answer or "\n-" in answer))
+        or lowered.startswith("--- ")
+    )
+
+
+def _is_answer_patch_parseable(text):
+    answer = _extract_answer_from_text(text)
+    if not answer:
+        return False
+    answer = answer.strip()
+    if not _looks_like_patch(answer):
+        return False
+    has_header = ("diff --git" in answer.lower()) or ("--- " in answer and "+++ " in answer)
+    has_hunk = "@@" in answer
+    return bool(has_header and has_hunk)
+
+
+def _answer_quality_flags(text):
+    answer = _extract_answer_from_text(text)
+    if not answer:
+        return {
+            "answer_kind": "missing",
+            "answer_ast_ok": False,
+            "answer_patch_ok": False,
+            "answer_quality_ok": False,
+        }
+
+    if _looks_like_patch(answer):
+        patch_ok = _is_answer_patch_parseable(text)
+        return {
+            "answer_kind": "patch",
+            "answer_ast_ok": False,
+            "answer_patch_ok": bool(patch_ok),
+            "answer_quality_ok": bool(patch_ok),
+        }
+
+    ast_ok = _is_answer_ast_parseable(text)
+    return {
+        "answer_kind": "code",
+        "answer_ast_ok": bool(ast_ok),
+        "answer_patch_ok": False,
+        "answer_quality_ok": bool(ast_ok),
+    }
+
+
 def _drop_prompt_answer_duplicates(dataset):
     """
     Remove exact/near-exact prompt+answer duplicates to reduce memorization and leakage risk.
@@ -662,6 +714,10 @@ def _collect_quality_metrics(dataset, pre_dedup_count, dedup_removed):
     with_prompt = 0
     with_asserts = 0
     answer_parse_ok = 0
+    code_answers = 0
+    patch_answers = 0
+    patch_parse_ok = 0
+    answer_quality_ok = 0
 
     for row in dataset:
         prompt = (row.get("prompt", "") or "").strip()
@@ -672,14 +728,25 @@ def _collect_quality_metrics(dataset, pre_dedup_count, dedup_removed):
             with_tests += 1
             if "assert " in tests:
                 with_asserts += 1
-        if row.get("answer_ast_ok", False):
+        answer_kind = str(row.get("answer_kind", "") or "").strip().lower()
+        if answer_kind == "code":
+            code_answers += 1
+        elif answer_kind == "patch":
+            patch_answers += 1
+        if bool(row.get("answer_ast_ok", False)):
             answer_parse_ok += 1
+        if bool(row.get("answer_patch_ok", False)):
+            patch_parse_ok += 1
+        if bool(row.get("answer_quality_ok", False)):
+            answer_quality_ok += 1
 
     test_coverage = (with_tests / total) if total else 0.0
     prompt_coverage = (with_prompt / total) if total else 0.0
     unique_ratio = (total / pre_dedup_count) if pre_dedup_count else 0.0
     dedup_ratio = (dedup_removed / pre_dedup_count) if pre_dedup_count else 0.0
-    answer_ast_parse_rate = (answer_parse_ok / total) if total else 0.0
+    answer_ast_parse_rate = (answer_parse_ok / code_answers) if code_answers else 0.0
+    answer_patch_parse_rate = (patch_parse_ok / patch_answers) if patch_answers else 0.0
+    answer_quality_rate = (answer_quality_ok / total) if total else 0.0
     assert_density_in_tests = (with_asserts / with_tests) if with_tests else 0.0
 
     return {
@@ -692,6 +759,10 @@ def _collect_quality_metrics(dataset, pre_dedup_count, dedup_removed):
         "unique_ratio": unique_ratio,
         "dedup_ratio": dedup_ratio,
         "answer_ast_parse_rate": answer_ast_parse_rate,
+        "answer_patch_parse_rate": answer_patch_parse_rate,
+        "answer_quality_rate": answer_quality_rate,
+        "code_answers": code_answers,
+        "patch_answers": patch_answers,
         "assert_density_in_tests": assert_density_in_tests,
     }
 
@@ -702,6 +773,11 @@ def _stable_hash_bucket(text, modulo=1000):
 
 
 def _split_train_val_holdout(dataset, holdout_policy="source_hash_v1", holdout_fraction=0.10, val_fraction=0.05):
+    allowed_policies = {"source_hash_v1"}
+    if holdout_policy not in allowed_policies:
+        raise RuntimeError(
+            f"Unsupported holdout_policy='{holdout_policy}'. Supported: {sorted(allowed_policies)}"
+        )
     holdout_fraction = max(0.01, min(0.5, holdout_fraction))
     val_fraction = max(0.01, min(0.4, val_fraction))
     holdout_mod = max(1, int(1000 * holdout_fraction))
@@ -1061,19 +1137,35 @@ def build_sota_dataset(
         and "<answer>" in _text(x.get("text"))
         and "</answer>" in _text(x.get("text"))
     )
-    final_ds = final_ds.map(
-        lambda x: {"answer_ast_ok": _is_answer_ast_parseable(x.get("text", ""))}
-    )
+    final_ds = final_ds.map(lambda x: _answer_quality_flags(x.get("text", "")))
     pre_dedup_count = len(final_ds)
     final_ds, dedup_removed = _drop_prompt_answer_duplicates(final_ds)
-    metrics = _collect_quality_metrics(final_ds, pre_dedup_count, dedup_removed)
+    metrics_before_quality_filter = _collect_quality_metrics(final_ds, pre_dedup_count, dedup_removed)
 
     print(
-        "Quality Metrics: "
+        "Quality Metrics (pre answer-quality filter): "
+        f"total={metrics_before_quality_filter['total']}, "
+        f"test_coverage={metrics_before_quality_filter['test_coverage']:.3f}, "
+        f"assert_density_in_tests={metrics_before_quality_filter['assert_density_in_tests']:.3f}, "
+        f"code_answer_ast_parse_rate={metrics_before_quality_filter['answer_ast_parse_rate']:.3f}, "
+        f"patch_answer_parse_rate={metrics_before_quality_filter['answer_patch_parse_rate']:.3f}, "
+        f"answer_quality_rate={metrics_before_quality_filter['answer_quality_rate']:.3f}, "
+        f"prompt_coverage={metrics_before_quality_filter['prompt_coverage']:.3f}, "
+        f"unique_ratio={metrics_before_quality_filter['unique_ratio']:.3f}, "
+        f"dedup_ratio={metrics_before_quality_filter['dedup_ratio']:.3f}"
+    )
+
+    # Remove non-parseable answers from final train/eval splits.
+    final_ds = final_ds.filter(lambda x: bool(x.get("answer_quality_ok", False)))
+    metrics = _collect_quality_metrics(final_ds, pre_dedup_count, dedup_removed)
+    print(
+        "Quality Metrics (post answer-quality filter): "
         f"total={metrics['total']}, "
         f"test_coverage={metrics['test_coverage']:.3f}, "
         f"assert_density_in_tests={metrics['assert_density_in_tests']:.3f}, "
-        f"answer_ast_parse_rate={metrics['answer_ast_parse_rate']:.3f}, "
+        f"code_answer_ast_parse_rate={metrics['answer_ast_parse_rate']:.3f}, "
+        f"patch_answer_parse_rate={metrics['answer_patch_parse_rate']:.3f}, "
+        f"answer_quality_rate={metrics['answer_quality_rate']:.3f}, "
         f"prompt_coverage={metrics['prompt_coverage']:.3f}, "
         f"unique_ratio={metrics['unique_ratio']:.3f}, "
         f"dedup_ratio={metrics['dedup_ratio']:.3f}"
@@ -1097,6 +1189,8 @@ def build_sota_dataset(
             "Answer-AST-Parse-Rate zu niedrig: "
             f"{metrics['answer_ast_parse_rate']:.3f} < min_answer_ast_parse_rate={min_answer_ast_parse_rate}"
         )
+    if metrics["code_answers"] == 0:
+        raise RuntimeError("No code answers remained after answer-quality filtering.")
     if metrics["prompt_coverage"] < min_prompt_coverage:
         raise RuntimeError(
             f"Prompt-Coverage zu niedrig: {metrics['prompt_coverage']:.3f} < min_prompt_coverage={min_prompt_coverage}"
@@ -1105,9 +1199,6 @@ def build_sota_dataset(
         raise RuntimeError(
             f"Unique-Ratio zu niedrig: {metrics['unique_ratio']:.3f} < min_unique_ratio={min_unique_ratio}"
         )
-
-    # Remove non-parseable answers from final train/eval splits.
-    final_ds = final_ds.filter(lambda x: bool(x.get("answer_ast_ok", False)))
 
     splits = _split_train_val_holdout(
         final_ds,
@@ -1152,6 +1243,7 @@ def build_sota_dataset(
         "source_weights": parsed_weights,
         "source_stats_loaded": source_stats,
         "missing_sources": missing_sources,
+        "metrics_pre_answer_quality_filter": metrics_before_quality_filter,
         "metrics": metrics,
         "split_sizes": {
             "train": len(splits["train"]),

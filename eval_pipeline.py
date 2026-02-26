@@ -39,6 +39,20 @@ def _build_sampling_params(seed: int, **kwargs) -> SamplingParams:
         return SamplingParams(**params)
 
 
+def _looks_like_hf_repo_id(model_path: str) -> bool:
+    value = str(model_path or "").strip()
+    if not value:
+        return False
+    if value.startswith(("/", "./", "../", "~")):
+        return False
+    if "\\" in value or " " in value:
+        return False
+    parts = value.split("/")
+    if len(parts) != 2:
+        return False
+    return all(bool(part.strip()) for part in parts)
+
+
 def _build_llm(model_path: str, max_model_len: int) -> LLM:
     if os.path.isdir(model_path):
         adapter_cfg = os.path.join(model_path, "adapter_config.json")
@@ -473,25 +487,41 @@ def _evaluate_patch_case(
             "<|im_start|>assistant\n"
         )
 
+    def _round1_budget(pass_k_value: int, num_strategies: int, strategy_idx: int) -> int:
+        # Keep true pass@k semantics by distributing a fixed first-round k budget across strategies.
+        pass_k_value = max(1, int(pass_k_value))
+        num_strategies = max(1, int(num_strategies))
+        base = pass_k_value // num_strategies
+        remainder = pass_k_value % num_strategies
+        budget = base + (1 if strategy_idx < remainder else 0)
+        return max(0, int(budget))
+
     format_errors = 0
-    pass_flags = []
+    first_round_flags = []
     best_similarity = 0.0
     best_patch = ""
     threshold = 0.70
     strategies = _parse_patch_strategies(patch_strategies)
     round_prompts = [{"prompt": prompt, "strategy": strategy} for strategy in strategies]
     rounds_used = 0
+    generated_candidates = 0
 
     for round_idx in range(1, max_rounds + 1):
         rounds_used = round_idx
         candidates_eval = []
-        for round_prompt in round_prompts:
+        for strategy_idx, round_prompt in enumerate(round_prompts):
             cur_prompt = str(round_prompt.get("prompt", "") or "")
             strategy = str(round_prompt.get("strategy", "balanced") or "balanced")
+            if round_idx == 1:
+                n_candidates = _round1_budget(pass_k, len(round_prompts), strategy_idx)
+                if n_candidates <= 0:
+                    continue
+            else:
+                n_candidates = max(1, pass_k // 2)
             sampling_seed = _stable_seed(base_seed, "patch", case_id, strategy, round_idx)
             sampling_params = _build_sampling_params(
                 seed=sampling_seed,
-                n=pass_k if round_idx == 1 else max(2, pass_k // 2),
+                n=n_candidates,
                 temperature=0.1 if round_idx == 1 else 0.25,
                 top_p=0.95,
                 max_tokens=max_tokens,
@@ -500,10 +530,12 @@ def _evaluate_patch_case(
             outputs = llm.generate([cur_prompt], sampling_params)
             candidates = outputs[0].outputs if outputs else []
             for candidate in candidates:
+                generated_candidates += 1
                 code = extract_xml_content(candidate.text, "answer")
                 if not code:
                     format_errors += 1
-                    pass_flags.append(False)
+                    if round_idx == 1:
+                        first_round_flags.append(False)
                     continue
                 similarity = _token_f1(code, reference_patch)
                 heuristic = patch_quality_score(code)
@@ -519,7 +551,8 @@ def _evaluate_patch_case(
                 if similarity > best_similarity:
                     best_similarity = similarity
                     best_patch = code
-                pass_flags.append(similarity >= threshold)
+                if round_idx == 1:
+                    first_round_flags.append(similarity >= threshold)
 
         if not candidates_eval:
             break
@@ -535,14 +568,14 @@ def _evaluate_patch_case(
             for row in top
         ]
 
-    if len(pass_flags) < pass_k:
-        pass_flags.extend([False] * (pass_k - len(pass_flags)))
+    if len(first_round_flags) < pass_k:
+        first_round_flags.extend([False] * (pass_k - len(first_round_flags)))
 
     return {
-        "pass_at_1": bool(pass_flags[0]) if pass_flags else False,
-        "pass_at_k": any(pass_flags),
+        "pass_at_1": bool(first_round_flags[0]) if first_round_flags else False,
+        "pass_at_k": any(first_round_flags[:pass_k]),
         "format_errors": format_errors,
-        "generated_candidates": max(1, pass_k),
+        "generated_candidates": max(1, generated_candidates),
         "rounds_used": max(1, rounds_used),
         "resolve_proxy": best_similarity,
         "best_patch": best_patch,
@@ -789,8 +822,10 @@ def generate_and_evaluate(
     json_output="",
     seed=3407,
 ):
-    if not os.path.exists(model_path) and not model_path.count("/") >= 1:
-        raise RuntimeError(f"Model path {model_path} not found. Ensure training is complete.")
+    if not os.path.exists(model_path) and not _looks_like_hf_repo_id(model_path):
+        raise RuntimeError(
+            f"Model path '{model_path}' not found. Use an existing local path or a valid Hugging Face repo id (org/model)."
+        )
 
     benchmark_list = [name.strip() for name in benchmarks.split(",") if name.strip()]
     if not benchmark_list:

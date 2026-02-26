@@ -416,13 +416,27 @@ def _stage_context_lengths(stage_name: str, max_seq_length: int):
         prompt_target = 1536
         completion_target = 1400
 
-    # Keep prompt+completion safely inside available context budget.
-    budget = max(1024, max_seq_length - 256)
-    prompt_len = min(prompt_target, max(512, budget - 1024))
-    completion_len = min(completion_target, max(512, budget - prompt_len))
-    if prompt_len + completion_len > budget:
-        completion_len = max(512, budget - prompt_len)
-    return int(prompt_len), int(completion_len)
+    # Keep prompt+completion strictly within available context budget.
+    budget = max(768, max_seq_length - 256)
+    min_prompt = 256
+    min_completion = 256
+
+    prompt_len = min(prompt_target, max(min_prompt, budget - min_completion))
+    completion_len = min(completion_target, max(min_completion, budget - prompt_len))
+
+    total = prompt_len + completion_len
+    if total > budget:
+        overflow = total - budget
+        reducible_prompt = max(0, prompt_len - min_prompt)
+        reduce_prompt = min(reducible_prompt, overflow)
+        prompt_len -= reduce_prompt
+        overflow -= reduce_prompt
+        if overflow > 0:
+            reducible_completion = max(0, completion_len - min_completion)
+            reduce_completion = min(reducible_completion, overflow)
+            completion_len -= reduce_completion
+
+    return int(max(min_prompt, prompt_len)), int(max(min_completion, completion_len))
 
 
 def _build_training_args(stage_steps, stage_name, seed, stage_output_dir, checkpoint_every_steps, max_seq_length):

@@ -192,8 +192,22 @@ def _sign_flip_pvalue(component_diffs: Dict[str, List[float]], observed_diff: fl
     return (extreme + 1) / (samples + 1)
 
 
-def _validate_core_artifacts(manifest_dir: str):
+def _validate_core_artifacts(
+    manifest_dir: str,
+    main_dataset_manifest_path: str = "",
+    swe_supervised_manifest_path: str = "",
+):
     workspace_root = os.path.abspath(os.path.join(manifest_dir, os.pardir, os.pardir))
+    main_manifest = (
+        main_dataset_manifest_path
+        if main_dataset_manifest_path
+        else os.path.join(workspace_root, "sota_slm_coding_dataset", "dataset_manifest.json")
+    )
+    swe_manifest = (
+        swe_supervised_manifest_path
+        if swe_supervised_manifest_path
+        else os.path.join(workspace_root, "swe_supervised_dataset", "dataset_manifest.json")
+    )
     required = [
         os.path.join(manifest_dir, "run_manifest.txt"),
         os.path.join(manifest_dir, "baseline_eval_classic.json"),
@@ -204,8 +218,8 @@ def _validate_core_artifacts(manifest_dir: str):
         os.path.join(manifest_dir, "baseline_eval_agentic_cases.jsonl"),
         os.path.join(manifest_dir, "posttrain_eval_classic_cases.jsonl"),
         os.path.join(manifest_dir, "posttrain_eval_agentic_cases.jsonl"),
-        os.path.join(workspace_root, "sota_slm_coding_dataset", "dataset_manifest.json"),
-        os.path.join(workspace_root, "swe_supervised_dataset", "dataset_manifest.json"),
+        main_manifest,
+        swe_manifest,
     ]
     missing = [path for path in required if not os.path.exists(path)]
     if missing:
@@ -223,10 +237,16 @@ def main():
     parser.add_argument("--significance-alpha", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--output-path", default="")
+    parser.add_argument("--main-dataset-manifest-path", default="")
+    parser.add_argument("--swe-supervised-manifest-path", default="")
     args = parser.parse_args()
 
     manifest_dir = args.manifest_dir
-    _validate_core_artifacts(manifest_dir)
+    _validate_core_artifacts(
+        manifest_dir,
+        main_dataset_manifest_path=args.main_dataset_manifest_path,
+        swe_supervised_manifest_path=args.swe_supervised_manifest_path,
+    )
 
     baseline_classic = _load_json(os.path.join(manifest_dir, "baseline_eval_classic.json"))
     baseline_agentic = _load_json(os.path.join(manifest_dir, "baseline_eval_agentic.json"))
@@ -314,6 +334,8 @@ def main():
     report = {
         "schema_version": "scientific_gate_v1",
         "manifest_dir": manifest_dir,
+        "main_dataset_manifest_path": args.main_dataset_manifest_path,
+        "swe_supervised_manifest_path": args.swe_supervised_manifest_path,
         "primary_score_ci_baseline": baseline_score_ci,
         "primary_score_ci_post": post_score_ci,
         "relative_improvement": rel_improvement,

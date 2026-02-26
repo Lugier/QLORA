@@ -533,6 +533,8 @@ python3 scripts/validate_cli_drift.py
 python3 -m unittest tests.test_verification tests.test_rewards tests.test_prm_tiny tests.test_scientific_gate
 python3 scripts/scientific_gate.py \
   --manifest-dir "${MANIFEST_DIR}" \
+  --main-dataset-manifest-path ./sota_slm_coding_dataset/dataset_manifest.json \
+  --swe-supervised-manifest-path ./swe_supervised_dataset/dataset_manifest.json \
   --require-relative-improvement 0.15 \
   --require-relative-improvement-lb 0.05 \
   --max-format-error-rate 0.02 \
