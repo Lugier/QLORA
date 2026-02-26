@@ -1,6 +1,8 @@
+import os
 import re
 from typing import Dict, List
 
+from prm_tiny import load_tiny_prm, predict_tiny_prm
 from verification import run_test_verifier
 
 
@@ -19,6 +21,28 @@ def extract_xml_content(text: str, tag: str) -> str:
 # Global state for AERO (Adaptive Execution Reward Optimization)
 AERO_GLOBAL_STEP = 0
 AERO_MAX_STEPS = 1500
+_PRM_MODEL_PATH = ""
+_PRM_TINY_MODEL = None
+
+
+def configure_process_reward_model(model_path: str = ""):
+    """
+    Configures optional tiny PRM model used by process_reward_func.
+    """
+    global _PRM_MODEL_PATH, _PRM_TINY_MODEL
+    _PRM_MODEL_PATH = (model_path or os.environ.get("SOTA_PRM_MODEL_PATH", "")).strip()
+    _PRM_TINY_MODEL = None
+    if not _PRM_MODEL_PATH:
+        return
+    if not os.path.exists(_PRM_MODEL_PATH):
+        print(f"WARNUNG: PRM model path not found: {_PRM_MODEL_PATH}. Falling back to heuristic process reward.")
+        return
+    try:
+        _PRM_TINY_MODEL = load_tiny_prm(_PRM_MODEL_PATH)
+        print(f"Loaded tiny PRM model from '{_PRM_MODEL_PATH}'.")
+    except Exception as exc:
+        _PRM_TINY_MODEL = None
+        print(f"WARNUNG: Failed to load PRM model '{_PRM_MODEL_PATH}': {exc}")
 
 
 def _completion_to_text(completion):
@@ -117,6 +141,21 @@ def _contains_any(text: str, keywords: List[str]) -> bool:
     return any(keyword in lowered for keyword in keywords)
 
 
+def _tiny_prm_score(prompt: str, reasoning: str, extracted_answer: str, tests: str) -> float:
+    if _PRM_TINY_MODEL is None:
+        return 0.5
+    record = (
+        f"prompt={prompt}\n"
+        f"reasoning={reasoning}\n"
+        f"tests={tests}\n"
+        f"answer={extracted_answer}"
+    )
+    try:
+        return float(predict_tiny_prm(_PRM_TINY_MODEL, record))
+    except Exception:
+        return 0.5
+
+
 def process_reward_func(prompts, completions, answer, **kwargs):
     """
     Lightweight PRM-style reward:
@@ -179,6 +218,14 @@ def process_reward_func(prompts, completions, answer, **kwargs):
                 score -= 0.12
             elif answer_len <= 220:
                 score += 0.06
+
+        prm_prob = _tiny_prm_score(
+            prompt=str(prompt or ""),
+            reasoning=str(reasoning or ""),
+            extracted_answer=str(extracted_answer or ""),
+            tests=expected_tests,
+        )
+        score += (prm_prob - 0.5) * 0.60
 
         rewards.append(max(-0.5, min(1.0, score)))
     return rewards

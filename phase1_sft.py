@@ -5,7 +5,7 @@ import torch
 from unsloth import FastLanguageModel
 from trl import SFTTrainer
 from transformers import TrainingArguments
-from datasets import DatasetDict, load_from_disk
+from datasets import Dataset, DatasetDict, concatenate_datasets, load_from_disk
 
 # ==============================================================================
 # Phase 1: Supervised Fine-Tuning (SFT) via Unsloth LoRA
@@ -36,6 +36,7 @@ def _latest_checkpoint(output_dir):
 
 def train_sft(
     dataset_path="./sota_slm_coding_dataset",
+    extra_dataset_paths="",
     output_dir="outputs_sft",
     adapter_dir="qwen_sft_lora",
     merged_model_dir="qwen_sft_merged",
@@ -90,22 +91,35 @@ def train_sft(
         random_state = seed,
     )
 
-    if not os.path.exists(dataset_path):
-        raise RuntimeError(f"Datensatz '{dataset_path}' nicht gefunden. Bitte data_pipeline.py zuerst ausführen.")
+    all_paths = [dataset_path] + [p.strip() for p in str(extra_dataset_paths).split(",") if p.strip()]
+    all_paths = [p for p in all_paths if p]
+    for ds_path in all_paths:
+        if not os.path.exists(ds_path):
+            raise RuntimeError(f"Datensatz '{ds_path}' nicht gefunden. Bitte data_pipeline.py zuerst ausführen.")
 
-    print("Loading compiled dataset...")
-    loaded = load_from_disk(dataset_path)
-    if isinstance(loaded, DatasetDict):
-        if "train" not in loaded:
-            raise RuntimeError(f"DatasetDict in '{dataset_path}' has no 'train' split.")
-        dataset = loaded["train"]
-        eval_dataset = loaded.get("val_strict")
-    else:
-        dataset = loaded
-        eval_dataset = None
+    print(f"Loading compiled datasets: {all_paths}")
+    train_splits = []
+    eval_splits = []
+    for ds_path in all_paths:
+        loaded = load_from_disk(ds_path)
+        if isinstance(loaded, DatasetDict):
+            if "train" not in loaded:
+                raise RuntimeError(f"DatasetDict in '{ds_path}' has no 'train' split.")
+            train_splits.append(loaded["train"])
+            if "val_strict" in loaded and len(loaded["val_strict"]) > 0:
+                eval_splits.append(loaded["val_strict"])
+        else:
+            train_splits.append(loaded)
+
+    if not train_splits:
+        raise RuntimeError("No training splits were loaded for SFT.")
+    dataset: Dataset = train_splits[0] if len(train_splits) == 1 else concatenate_datasets(train_splits).shuffle(seed=seed)
+    eval_dataset = None
+    if eval_splits:
+        eval_dataset = eval_splits[0] if len(eval_splits) == 1 else concatenate_datasets(eval_splits).shuffle(seed=seed)
 
     if len(dataset) == 0:
-        raise RuntimeError(f"Datensatz '{dataset_path}' ist leer.")
+        raise RuntimeError(f"Datensatz-Mix ist leer. Pfade: {all_paths}")
     dataset_num_proc = max(1, min(8, os.cpu_count() or 1))
 
     use_eval = eval_dataset is not None and len(eval_dataset) > 0 and eval_every_steps > 0
@@ -188,6 +202,7 @@ def train_sft(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run SFT stage.")
     parser.add_argument("--dataset-path", default="./sota_slm_coding_dataset")
+    parser.add_argument("--extra-dataset-paths", default="")
     parser.add_argument("--output-dir", default="outputs_sft")
     parser.add_argument("--adapter-dir", default="qwen_sft_lora")
     parser.add_argument("--merged-model-dir", default="qwen_sft_merged")
@@ -208,6 +223,7 @@ if __name__ == "__main__":
 
     train_sft(
         dataset_path=args.dataset_path,
+        extra_dataset_paths=args.extra_dataset_paths,
         output_dir=args.output_dir,
         adapter_dir=args.adapter_dir,
         merged_model_dir=args.merged_model_dir,

@@ -1,9 +1,12 @@
 import os
+import json
 import hashlib
 import argparse
 import re
 import ast
+import subprocess
 from typing import Dict
+from datetime import datetime
 
 from datasets import DatasetDict, load_dataset, concatenate_datasets
 
@@ -30,6 +33,71 @@ def _extract_tests(example):
             return "\n".join([str(item) for item in value if item])
         return str(value)
     return ""
+
+
+def _extract_swe_tests(example):
+    candidates = [
+        example.get("tests"),
+        example.get("test"),
+        example.get("FAIL_TO_PASS"),
+        example.get("PASS_TO_PASS"),
+        example.get("unit_tests"),
+        example.get("public_tests"),
+        example.get("private_tests"),
+        example.get("regression_tests"),
+    ]
+    chunks = []
+    for value in candidates:
+        if not value:
+            continue
+        if isinstance(value, list):
+            text = "\n".join([str(item) for item in value if item])
+        else:
+            text = str(value)
+        text = text.strip()
+        if text:
+            chunks.append(text)
+    if not chunks:
+        return ""
+    dedup = []
+    seen = set()
+    for chunk in chunks:
+        normalized = re.sub(r"\s+", " ", chunk).strip().lower()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        dedup.append(chunk)
+    return "\n\n".join(dedup)
+
+
+def _extract_affected_files(example):
+    keys = [
+        "files",
+        "file_paths",
+        "changed_files",
+        "impacted_files",
+        "relevant_files",
+    ]
+    for key in keys:
+        value = example.get(key)
+        if not value:
+            continue
+        if isinstance(value, list):
+            vals = [str(v).strip() for v in value if str(v).strip()]
+            if vals:
+                return vals
+        else:
+            text = str(value).strip()
+            if text:
+                return [text]
+    return []
+
+
+def _truncate_text(text, max_chars):
+    text = _text(text).strip()
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "\n...[truncated]"
 
 
 def _prompt_prefix_from_text(formatted_text):
@@ -267,6 +335,41 @@ def format_bug_prompt(example):
     return _build_record(example, formatted_text)
 
 
+def format_swe_supervised_bug(example, source_name="swe_bug", max_context_chars=6000):
+    issue = _truncate_text(
+        _text(example.get("problem_statement", example.get("issue", example.get("prompt", "")))).strip(),
+        max_context_chars,
+    )
+    patch = _text(example.get("patch", example.get("gold_patch", example.get("solution_patch", "")))).strip()
+    tests = _extract_swe_tests(example)
+    affected_files = _extract_affected_files(example)
+    files_block = "\n".join([f"- {p}" for p in affected_files[:20]])
+    files_text = f"\nAffected files:\n{files_block}" if files_block else ""
+
+    system_prompt = (
+        "You are an expert SWE assistant. Solve repository issues by proposing a precise unified patch "
+        "inside <answer> tags after concise reasoning in <reasoning> tags."
+    )
+    user_prompt = f"Issue:\n{issue}{files_text}"
+    reasoning = _text(example.get("analysis", example.get("hints", ""))).strip()
+    formatted = (
+        f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
+        f"{_assistant_block(patch, reasoning)}"
+    )
+    return {
+        "text": formatted,
+        "prompt": _prompt_prefix_from_text(formatted),
+        "tests": tests,
+        "issue": issue,
+        "affected_files": "\n".join(affected_files[:50]),
+        "patch": patch,
+        "trajectory": "",
+        "source": source_name,
+        "swe_granularity": "repo_level",
+    }
+
+
 def format_evol_prompt(example):
     """
     Formatierung für komplexe, schrittweise Evol-Instruct Coding Probleme.
@@ -331,6 +434,60 @@ def format_trajectory_prompt(example):
         f"{_assistant_block(final_patch, reasoning_text)}"
     )
     return _build_record(example, formatted_text)
+
+
+def format_swe_supervised_trajectory(example, source_name="swe_trajectory", max_context_chars=6000):
+    issue = _truncate_text(
+        _text(example.get("problem_statement", example.get("issue", example.get("instance_id", "")))).strip(),
+        max_context_chars,
+    )
+    trajectory = example.get("trajectory", [])
+    patch = _text(
+        example.get("patch")
+        or example.get("gold_patch")
+        or example.get("model_patch")
+        or example.get("final_patch")
+        or ""
+    ).strip()
+    tests = _extract_swe_tests(example)
+    affected_files = _extract_affected_files(example)
+
+    trajectory_lines = []
+    if isinstance(trajectory, list):
+        for step in trajectory[:60]:
+            if not isinstance(step, dict):
+                continue
+            action = _truncate_text(step.get("action", ""), 280)
+            observation = _truncate_text(step.get("observation", ""), 360)
+            if action:
+                trajectory_lines.append(f"[ACTION] {action}")
+            if observation:
+                trajectory_lines.append(f"[OBS] {observation}")
+    trajectory_text = "\n".join(trajectory_lines)
+
+    files_block = "\n".join([f"- {p}" for p in affected_files[:20]])
+    files_text = f"\nAffected files:\n{files_block}" if files_block else ""
+    system_prompt = (
+        "You are an autonomous SWE agent. Use prior tool traces to craft a robust final patch "
+        "inside <answer> tags."
+    )
+    user_prompt = f"Issue:\n{issue}{files_text}\n\nTrajectory:\n{trajectory_text}"
+    formatted = (
+        f"<|im_start|>system\n{system_prompt}<|im_end|>\n"
+        f"<|im_start|>user\n{user_prompt}<|im_end|>\n"
+        f"{_assistant_block(patch, trajectory_text[:1200])}"
+    )
+    return {
+        "text": formatted,
+        "prompt": _prompt_prefix_from_text(formatted),
+        "tests": tests,
+        "issue": issue,
+        "affected_files": "\n".join(affected_files[:50]),
+        "patch": patch,
+        "trajectory": trajectory_text,
+        "source": source_name,
+        "swe_granularity": "repo_level",
+    }
 
 
 def format_stratos_prompt(example):
@@ -590,8 +747,54 @@ def _print_source_report(source_stats):
     print("=============================\n")
 
 
+def _safe_git_commit():
+    try:
+        out = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        return out.strip()
+    except Exception:
+        return "unknown"
+
+
+def _sample_key(row):
+    prompt = (row.get("prompt", "") or "").strip()
+    answer = _extract_answer_from_text(row.get("text", ""))
+    source = str(row.get("source", "") or "unknown").strip().lower()
+    key = f"{source}||{prompt}||{answer}"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def _assert_split_disjoint(splits):
+    key_sets = {}
+    for split_name, ds in splits.items():
+        keys = set()
+        for row in ds:
+            keys.add(_sample_key(row))
+        key_sets[split_name] = keys
+    split_names = sorted(key_sets.keys())
+    for i, left in enumerate(split_names):
+        for right in split_names[i + 1 :]:
+            overlap = len(key_sets[left].intersection(key_sets[right]))
+            if overlap > 0:
+                raise RuntimeError(
+                    f"Split contamination detected between '{left}' and '{right}': overlap={overlap}"
+                )
+
+
+def _write_json(path, payload):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
 def build_sota_dataset(
     output_dir="./sota_slm_coding_dataset",
+    swe_supervised_output_dir="./swe_supervised_dataset",
+    swe_supervised_max_samples=120000,
+    require_swe_supervised=True,
     min_total_samples=20000,
     min_test_coverage=0.08,
     min_prompt_coverage=0.99,
@@ -612,6 +815,7 @@ def build_sota_dataset(
     print("Initiating dataset curation pipeline...")
     source_stats = {}
     missing_sources = []
+    swe_supervised_parts = []
     
     # 1. Distilled Rationales (OpenCodeReasoning)
     print("Loading OpenCodeReasoning subset (focused on high diversity)...")
@@ -651,6 +855,14 @@ def build_sota_dataset(
     print("Loading Verified Bugs for repository-level alignment...")
     try:
         ds_bugs = load_dataset("princeton-nlp/SWE-bench_Lite", split="train[:15000]")
+        ds_swe_supervised_bugs = ds_bugs.map(
+            lambda x: format_swe_supervised_bug(
+                x,
+                source_name="princeton-nlp/SWE-bench_Lite",
+            ),
+            remove_columns=ds_bugs.column_names,
+        )
+        swe_supervised_parts.append(ds_swe_supervised_bugs)
         ds_bugs = ds_bugs.filter(
             lambda x: _has_nonempty_text(x.get("problem_statement"))
             and _has_nonempty_text(x.get("patch"))
@@ -686,6 +898,14 @@ def build_sota_dataset(
     print("Loading SWE-agent Trajectories for multi-turn tool use...")
     try:
         ds_traj = load_dataset("princeton-nlp/SWE-agent-trajectories", split="train[:5000]")
+        ds_swe_supervised_traj = ds_traj.map(
+            lambda x: format_swe_supervised_trajectory(
+                x,
+                source_name="princeton-nlp/SWE-agent-trajectories",
+            ),
+            remove_columns=ds_traj.column_names,
+        )
+        swe_supervised_parts.append(ds_swe_supervised_traj)
         ds_traj = ds_traj.filter(
             lambda x: _has_nonempty_text(
                 x.get("patch")
@@ -780,6 +1000,14 @@ def build_sota_dataset(
     print("Loading SWE-bench-Live verified for up-to-date repository fixing...")
     try:
         ds_swe_live = load_dataset("SWE-bench-Live/SWE-bench-Live", split="verified[:8000]")
+        ds_swe_supervised_live = ds_swe_live.map(
+            lambda x: format_swe_supervised_bug(
+                x,
+                source_name="SWE-bench-Live/SWE-bench-Live:verified",
+            ),
+            remove_columns=ds_swe_live.column_names,
+        )
+        swe_supervised_parts.append(ds_swe_supervised_live)
         ds_swe_live = ds_swe_live.filter(
             lambda x: _has_nonempty_text(x.get("problem_statement"))
             and _has_nonempty_text(x.get("patch"))
@@ -887,6 +1115,7 @@ def build_sota_dataset(
         holdout_fraction=holdout_fraction,
         val_fraction=val_fraction,
     )
+    _assert_split_disjoint(splits)
     dataset_dict = DatasetDict(
         {
             "train": splits["train"],
@@ -903,10 +1132,119 @@ def build_sota_dataset(
         f"holdout_clean={len(splits['holdout_clean'])}"
     )
     print(f"Saved to: {output_dir}")
+    main_manifest = {
+        "created_at_utc": datetime.utcnow().isoformat() + "Z",
+        "git_commit": _safe_git_commit(),
+        "seed": int(seed),
+        "schema_version": "sota_data_manifest_v1",
+        "output_dir": output_dir,
+        "quality_thresholds": {
+            "min_total_samples": min_total_samples,
+            "min_test_coverage": min_test_coverage,
+            "min_prompt_coverage": min_prompt_coverage,
+            "min_unique_ratio": min_unique_ratio,
+            "min_answer_ast_parse_rate": min_answer_ast_parse_rate,
+            "min_assert_density_in_tests": min_assert_density_in_tests,
+        },
+        "holdout_policy": holdout_policy,
+        "holdout_fraction": holdout_fraction,
+        "val_fraction": val_fraction,
+        "source_weights": parsed_weights,
+        "source_stats_loaded": source_stats,
+        "missing_sources": missing_sources,
+        "metrics": metrics,
+        "split_sizes": {
+            "train": len(splits["train"]),
+            "val_strict": len(splits["val_strict"]),
+            "holdout_clean": len(splits["holdout_clean"]),
+        },
+        "dataset_fingerprints": {
+            "train": getattr(splits["train"], "_fingerprint", ""),
+            "val_strict": getattr(splits["val_strict"], "_fingerprint", ""),
+            "holdout_clean": getattr(splits["holdout_clean"], "_fingerprint", ""),
+        },
+    }
+    _write_json(os.path.join(output_dir, "dataset_manifest.json"), main_manifest)
+    print(f"Saved dataset manifest to: {os.path.join(output_dir, 'dataset_manifest.json')}")
+
+    # Build dedicated SWE-supervised dataset (issue->patch + trajectories) for focused SFT/ORPO/RL phases.
+    swe_supervised_parts = [ds for ds in swe_supervised_parts if ds is not None and len(ds) > 0]
+    if swe_supervised_parts:
+        swe_ds = concatenate_datasets(swe_supervised_parts).shuffle(seed=seed)
+        swe_ds = swe_ds.filter(
+            lambda x: _has_nonempty_text(x.get("prompt"))
+            and _has_nonempty_text(x.get("patch"))
+            and "<answer>" in _text(x.get("text"))
+            and "</answer>" in _text(x.get("text"))
+        )
+        pre_swe = len(swe_ds)
+        swe_ds, swe_dedup_removed = _drop_prompt_answer_duplicates(swe_ds)
+        if swe_supervised_max_samples > 0 and len(swe_ds) > swe_supervised_max_samples:
+            swe_ds = swe_ds.select(range(int(swe_supervised_max_samples)))
+
+        swe_splits = _split_train_val_holdout(
+            swe_ds,
+            holdout_policy=holdout_policy,
+            holdout_fraction=holdout_fraction,
+            val_fraction=val_fraction,
+        )
+        _assert_split_disjoint(swe_splits)
+        swe_dataset_dict = DatasetDict(
+            {
+                "train": swe_splits["train"],
+                "val_strict": swe_splits["val_strict"],
+                "holdout_clean": swe_splits["holdout_clean"],
+            }
+        )
+        os.makedirs(os.path.dirname(swe_supervised_output_dir) or ".", exist_ok=True)
+        swe_dataset_dict.save_to_disk(swe_supervised_output_dir)
+        print(
+            "SWE-supervised dataset compiled: "
+            f"raw={pre_swe}, dedup_removed={swe_dedup_removed}, "
+            f"train={len(swe_splits['train'])}, val_strict={len(swe_splits['val_strict'])}, "
+            f"holdout_clean={len(swe_splits['holdout_clean'])}"
+        )
+        print(f"Saved SWE-supervised dataset to: {swe_supervised_output_dir}")
+        swe_manifest = {
+            "created_at_utc": datetime.utcnow().isoformat() + "Z",
+            "git_commit": _safe_git_commit(),
+            "seed": int(seed),
+            "schema_version": "swe_supervised_manifest_v1",
+            "output_dir": swe_supervised_output_dir,
+            "raw_samples": int(pre_swe),
+            "dedup_removed": int(swe_dedup_removed),
+            "max_samples": int(swe_supervised_max_samples),
+            "holdout_policy": holdout_policy,
+            "holdout_fraction": holdout_fraction,
+            "val_fraction": val_fraction,
+            "split_sizes": {
+                "train": len(swe_splits["train"]),
+                "val_strict": len(swe_splits["val_strict"]),
+                "holdout_clean": len(swe_splits["holdout_clean"]),
+            },
+            "dataset_fingerprints": {
+                "train": getattr(swe_splits["train"], "_fingerprint", ""),
+                "val_strict": getattr(swe_splits["val_strict"], "_fingerprint", ""),
+                "holdout_clean": getattr(swe_splits["holdout_clean"], "_fingerprint", ""),
+            },
+        }
+        _write_json(os.path.join(swe_supervised_output_dir, "dataset_manifest.json"), swe_manifest)
+        print(
+            f"Saved SWE-supervised dataset manifest to: {os.path.join(swe_supervised_output_dir, 'dataset_manifest.json')}"
+        )
+    elif require_swe_supervised:
+        raise RuntimeError(
+            "SWE-supervised dataset requested but no SWE issue/trajectory sources were available."
+        )
+    else:
+        print("WARNUNG: SWE-supervised dataset could not be built (no SWE sources available).")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build curated SOTA SLM coding dataset.")
     parser.add_argument("--output-dir", default="./sota_slm_coding_dataset")
+    parser.add_argument("--swe-supervised-output-dir", default="./swe_supervised_dataset")
+    parser.add_argument("--swe-supervised-max-samples", type=int, default=120000)
+    parser.add_argument("--allow-missing-swe-supervised", action="store_true")
     parser.add_argument("--min-total-samples", type=int, default=20000)
     parser.add_argument("--min-test-coverage", type=float, default=0.08)
     parser.add_argument("--min-prompt-coverage", type=float, default=0.99)
@@ -924,6 +1262,9 @@ if __name__ == "__main__":
 
     build_sota_dataset(
         output_dir=args.output_dir,
+        swe_supervised_output_dir=args.swe_supervised_output_dir,
+        swe_supervised_max_samples=args.swe_supervised_max_samples,
+        require_swe_supervised=not args.allow_missing_swe_supervised,
         min_total_samples=args.min_total_samples,
         min_test_coverage=args.min_test_coverage,
         min_prompt_coverage=args.min_prompt_coverage,

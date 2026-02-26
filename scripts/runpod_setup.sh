@@ -81,6 +81,8 @@ if missing:
 
 if not hasattr(trl, "GRPOTrainer"):
     raise SystemExit("Installed TRL build does not provide GRPOTrainer.")
+if not hasattr(trl, "ORPOTrainer"):
+    raise SystemExit("Installed TRL build does not provide ORPOTrainer.")
 
 if not torch.cuda.is_available():
     raise SystemExit("Torch installed but CUDA is not available.")

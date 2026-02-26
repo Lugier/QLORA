@@ -259,18 +259,16 @@ def _macro_bucket(example):
     return "core_code"
 
 
-def _quartile_splits(ds):
+def _tier_splits_easy_mid_hard(ds):
     if len(ds) == 0:
         return []
     scores = sorted(float(x) for x in ds["difficulty_score"])
-    q1 = scores[len(scores) // 4]
-    q2 = scores[len(scores) // 2]
-    q3 = scores[(3 * len(scores)) // 4]
+    q1 = scores[len(scores) // 3]
+    q2 = scores[(2 * len(scores)) // 3]
     buckets = [
         ("easy", ds.filter(lambda x: float(x["difficulty_score"]) <= q1)),
         ("mid", ds.filter(lambda x: q1 < float(x["difficulty_score"]) <= q2)),
-        ("hard", ds.filter(lambda x: q2 < float(x["difficulty_score"]) <= q3)),
-        ("expert", ds.filter(lambda x: float(x["difficulty_score"]) > q3)),
+        ("hard", ds.filter(lambda x: float(x["difficulty_score"]) > q2)),
     ]
     return [(name, split) for name, split in buckets if len(split) > 0]
 
@@ -290,8 +288,8 @@ def _split_two_dimensional_curriculum(rl_dataset):
     stages = []
     core_ratio_total = 0.45
     repo_ratio_total = 0.55
-    core_parts = _quartile_splits(core_ds)
-    repo_parts = _quartile_splits(repo_ds)
+    core_parts = _tier_splits_easy_mid_hard(core_ds)
+    repo_parts = _tier_splits_easy_mid_hard(repo_ds)
     if not core_parts or not repo_parts:
         return _split_curriculum_stages(rl_dataset)
 
@@ -540,6 +538,7 @@ def train_grpo(
     priority_source_boost=1.8,
     priority_sources="online_hard_mining,tool_trajectory_distill",
     reward_profile="prm_outcome_v1",
+    prm_model_path="",
     hard_replay_dataset="",
     hard_replay_steps=180,
     checkpoint_every_steps=120,
@@ -564,6 +563,7 @@ def train_grpo(
     PatchFastRL("GRPO", FastLanguageModel)
     rewards_module.AERO_GLOBAL_STEP = 0
     rewards_module.AERO_MAX_STEPS = max_steps
+    rewards_module.configure_process_reward_model(prm_model_path)
 
     print("Loading baseline model for GRPO alignment...")
     model, tokenizer = FastLanguageModel.from_pretrained(
@@ -573,7 +573,7 @@ def train_grpo(
         fast_inference=True,
     )
 
-    preferred_adapter_paths = [output_adapter_dir, "qwen_dpo_lora", "qwen_sft_lora"]
+    preferred_adapter_paths = [output_adapter_dir, "qwen_orpo_lora", "qwen_dpo_lora", "qwen_sft_lora"]
     loaded_adapter = None
     for adapter_path in preferred_adapter_paths:
         if os.path.exists(adapter_path):
@@ -796,6 +796,7 @@ if __name__ == "__main__":
     parser.add_argument("--priority-source-boost", type=float, default=1.8)
     parser.add_argument("--priority-sources", default="online_hard_mining,tool_trajectory_distill")
     parser.add_argument("--reward-profile", default="prm_outcome_v1")
+    parser.add_argument("--prm-model-path", default="")
     parser.add_argument("--hard-replay-dataset", default="")
     parser.add_argument("--hard-replay-steps", type=int, default=180)
     parser.add_argument("--checkpoint-every-steps", type=int, default=120)
@@ -829,6 +830,7 @@ if __name__ == "__main__":
         priority_source_boost=args.priority_source_boost,
         priority_sources=args.priority_sources,
         reward_profile=args.reward_profile,
+        prm_model_path=args.prm_model_path,
         hard_replay_dataset=args.hard_replay_dataset,
         hard_replay_steps=args.hard_replay_steps,
         checkpoint_every_steps=args.checkpoint_every_steps,

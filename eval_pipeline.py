@@ -5,10 +5,11 @@ import random
 import re
 import subprocess
 import tempfile
+import hashlib
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
-from datasets import load_dataset
+from datasets import DatasetDict, load_dataset, load_from_disk
 from runtime_agent import solve_with_self_debug
 from verification import run_test_verifier
 from vllm import LLM, SamplingParams
@@ -19,6 +20,23 @@ def extract_xml_content(text: str, tag: str) -> str:
     if match:
         return match.group(1).strip()
     return ""
+
+
+def _stable_seed(base_seed: int, *parts: str) -> int:
+    payload = "|".join([str(base_seed)] + [str(p) for p in parts])
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return int(digest[:8], 16)
+
+
+def _build_sampling_params(seed: int, **kwargs) -> SamplingParams:
+    # SamplingParams signature changed across vLLM versions; keep backward compatibility.
+    params = dict(kwargs)
+    params["seed"] = int(seed)
+    try:
+        return SamplingParams(**params)
+    except TypeError:
+        params.pop("seed", None)
+        return SamplingParams(**params)
 
 
 def _build_llm(model_path: str, max_model_len: int) -> LLM:
@@ -247,7 +265,57 @@ def _load_swebench_verified_subset_cases(num_samples: int) -> List[Dict[str, str
     return cases
 
 
-def _load_benchmark_cases(benchmarks: List[str], num_samples: int) -> Dict[str, List[Dict[str, str]]]:
+def _load_private_holdout_cases(num_samples: int, private_holdout_path: str) -> List[Dict[str, str]]:
+    if not private_holdout_path:
+        raise RuntimeError("Benchmark 'private_holdout' requires --private-holdout-path.")
+    if not os.path.exists(private_holdout_path):
+        raise RuntimeError(f"Private holdout dataset path not found: {private_holdout_path}")
+
+    ds = load_from_disk(private_holdout_path)
+    if isinstance(ds, DatasetDict):
+        if "holdout_clean" in ds:
+            ds = ds["holdout_clean"]
+        elif "test" in ds:
+            ds = ds["test"]
+        elif "val_strict" in ds:
+            ds = ds["val_strict"]
+        elif "train" in ds:
+            ds = ds["train"]
+        else:
+            split_name = sorted(ds.keys())[0]
+            ds = ds[split_name]
+
+    if len(ds) == 0:
+        raise RuntimeError("Private holdout dataset is empty.")
+
+    n = min(num_samples, len(ds))
+    rows = ds.select(range(n))
+    cases = []
+    for idx, row in enumerate(rows):
+        prompt = str(row.get("prompt", "") or "").strip()
+        tests = str(row.get("tests", "") or "").strip()
+        if not prompt or not tests:
+            continue
+        cases.append(
+            {
+                "benchmark": "private_holdout",
+                "id": str(row.get("id", f"private_holdout_{idx}")),
+                "prompt": prompt,
+                "tests": tests,
+                "mode": "code",
+            }
+        )
+    if not cases:
+        raise RuntimeError("Private holdout loaded but no prompt+tests records were found.")
+    return cases
+
+
+def _load_benchmark_cases(
+    benchmarks: List[str],
+    num_samples: int,
+    private_holdout_path: str = "",
+    case_id_filter: Optional[Dict[str, set]] = None,
+) -> Dict[str, List[Dict[str, str]]]:
     cases_by_benchmark = {}
     for bench in benchmarks:
         name = bench.strip().lower()
@@ -266,11 +334,52 @@ def _load_benchmark_cases(benchmarks: List[str], num_samples: int) -> Dict[str, 
         if name == "swebench_verified_subset":
             cases_by_benchmark["swebench_verified_subset"] = _load_swebench_verified_subset_cases(num_samples)
             continue
+        if name == "private_holdout":
+            cases_by_benchmark["private_holdout"] = _load_private_holdout_cases(
+                num_samples=num_samples,
+                private_holdout_path=private_holdout_path,
+            )
+            continue
         raise RuntimeError(
             "Unsupported benchmark '"
-            f"{bench}'. Supported: mbpp, humaneval, livecodebench, bigcodebench_instruct, swebench_verified_subset"
+            f"{bench}'. Supported: mbpp, humaneval, livecodebench, bigcodebench_instruct, swebench_verified_subset, private_holdout"
         )
+    if case_id_filter:
+        for bench_name, cases in list(cases_by_benchmark.items()):
+            allowed = case_id_filter.get(bench_name)
+            if not allowed:
+                continue
+            filtered = [row for row in cases if str(row.get("id", "")) in allowed]
+            if not filtered:
+                raise RuntimeError(
+                    f"Case-ID filter removed all cases for benchmark '{bench_name}'. "
+                    "Ensure baseline case logs match current benchmark dataset IDs."
+                )
+            cases_by_benchmark[bench_name] = filtered
     return cases_by_benchmark
+
+
+def _load_case_id_filter(path: str) -> Dict[str, set]:
+    if not path:
+        return {}
+    if not os.path.exists(path):
+        raise RuntimeError(f"Case-ID filter path not found: {path}")
+    allowed: Dict[str, set] = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except Exception:
+                continue
+            bench = str(row.get("benchmark", "") or "").strip().lower()
+            case_id = str(row.get("id", "") or "").strip()
+            if not bench or not case_id:
+                continue
+            allowed.setdefault(bench, set()).add(case_id)
+    return allowed
 
 
 def _normalize_patch(text: str) -> str:
@@ -312,6 +421,9 @@ def _evaluate_patch_case(
     search_mode: str = "greedy",
     beam_width: int = 2,
     max_rounds: int = 3,
+    patch_strategies: str = "minimal_diff,api_first,test_first",
+    base_seed: int = 3407,
+    case_id: str = "",
 ) -> Dict[str, object]:
     def patch_quality_score(patch_text: str) -> float:
         text = (patch_text or "").strip()
@@ -333,11 +445,26 @@ def _evaluate_patch_case(
             score -= 0.6
         return score
 
-    def build_patch_repair_prompt(base_prompt: str, previous_patch: str, round_idx: int) -> str:
+    def _parse_patch_strategies(value: str) -> List[str]:
+        allowed = {"minimal_diff", "api_first", "test_first", "balanced"}
+        parsed = [p.strip().lower() for p in str(value or "").split(",") if p.strip()]
+        parsed = [p for p in parsed if p in allowed]
+        return parsed or ["minimal_diff", "api_first", "test_first"]
+
+    def _strategy_suffix(strategy: str) -> str:
+        if strategy == "minimal_diff":
+            return "Focus on smallest safe patch and avoid unrelated edits."
+        if strategy == "api_first":
+            return "Prioritize interface and signature correctness before internals."
+        if strategy == "test_first":
+            return "Prioritize behaviors implied by tests/regressions and edge conditions."
+        return "Balance correctness, minimality, and maintainability."
+
+    def build_patch_repair_prompt(base_prompt: str, previous_patch: str, round_idx: int, strategy: str) -> str:
         critique = (
             f"Patch refinement round {round_idx}. "
             "Return a valid unified git patch with file headers and hunks. "
-            "Minimize unrelated edits."
+            f"{_strategy_suffix(strategy)}"
         )
         return (
             f"{base_prompt}"
@@ -351,14 +478,19 @@ def _evaluate_patch_case(
     best_similarity = 0.0
     best_patch = ""
     threshold = 0.70
-    round_prompts = [prompt]
+    strategies = _parse_patch_strategies(patch_strategies)
+    round_prompts = [{"prompt": prompt, "strategy": strategy} for strategy in strategies]
     rounds_used = 0
 
     for round_idx in range(1, max_rounds + 1):
         rounds_used = round_idx
         candidates_eval = []
-        for cur_prompt in round_prompts:
-            sampling_params = SamplingParams(
+        for round_prompt in round_prompts:
+            cur_prompt = str(round_prompt.get("prompt", "") or "")
+            strategy = str(round_prompt.get("strategy", "balanced") or "balanced")
+            sampling_seed = _stable_seed(base_seed, "patch", case_id, strategy, round_idx)
+            sampling_params = _build_sampling_params(
+                seed=sampling_seed,
                 n=pass_k if round_idx == 1 else max(2, pass_k // 2),
                 temperature=0.1 if round_idx == 1 else 0.25,
                 top_p=0.95,
@@ -381,6 +513,7 @@ def _evaluate_patch_case(
                         "similarity": similarity,
                         "heuristic": heuristic,
                         "combined": similarity + (0.08 * heuristic),
+                        "strategy": strategy,
                     }
                 )
                 if similarity > best_similarity:
@@ -394,7 +527,13 @@ def _evaluate_patch_case(
         if search_mode not in {"beam", "mcts"}:
             break
         top = candidates_eval[: max(1, int(beam_width))]
-        round_prompts = [build_patch_repair_prompt(prompt, row["code"], round_idx) for row in top]
+        round_prompts = [
+            {
+                "prompt": build_patch_repair_prompt(prompt, row["code"], round_idx, str(row.get("strategy", "balanced"))),
+                "strategy": str(row.get("strategy", "balanced")),
+            }
+            for row in top
+        ]
 
     if len(pass_flags) < pass_k:
         pass_flags.extend([False] * (pass_k - len(pass_flags)))
@@ -418,8 +557,12 @@ def _evaluate_classic_case(
     max_tokens: int,
     timeout: float,
     verifier_rounds: int,
+    base_seed: int = 3407,
+    case_id: str = "",
 ) -> Dict[str, object]:
-    sampling_params = SamplingParams(
+    sampling_seed = _stable_seed(base_seed, "classic", case_id)
+    sampling_params = _build_sampling_params(
+        seed=sampling_seed,
         n=pass_k,
         temperature=0.0 if pass_k == 1 else 0.25,
         top_p=0.95,
@@ -631,6 +774,9 @@ def generate_and_evaluate(
     swebench_dataset_name="princeton-nlp/SWE-bench_Verified",
     swebench_split="test",
     swebench_max_workers=4,
+    private_holdout_path="",
+    patch_strategies="minimal_diff,api_first,test_first",
+    case_id_filter_path="",
     swebench_harness_cmd=(
         "python3 -m swebench.harness.run_evaluation "
         "--dataset_name {dataset_name} "
@@ -641,6 +787,7 @@ def generate_and_evaluate(
     ),
     case_log_path="",
     json_output="",
+    seed=3407,
 ):
     if not os.path.exists(model_path) and not model_path.count("/") >= 1:
         raise RuntimeError(f"Model path {model_path} not found. Ensure training is complete.")
@@ -652,14 +799,27 @@ def generate_and_evaluate(
     print(f"Loading model '{model_path}' via vLLM for evaluation...")
     llm = _build_llm(model_path=model_path, max_model_len=max_model_len)
 
+    case_id_filter = _load_case_id_filter(case_id_filter_path)
+    if case_id_filter:
+        print(f"Applying case-ID filter from '{case_id_filter_path}' for paired evaluation consistency.")
+
     print(f"Loading benchmarks: {benchmark_list}")
-    cases_by_benchmark = _load_benchmark_cases(benchmark_list, num_samples=num_samples)
+    cases_by_benchmark = _load_benchmark_cases(
+        benchmark_list,
+        num_samples=num_samples,
+        private_holdout_path=private_holdout_path,
+        case_id_filter=case_id_filter,
+    )
 
     overall_records = []
     report = {
         "model_path": model_path,
         "benchmarks": benchmark_list,
         "mode": "agentic" if use_agentic else "classic",
+        "seed": int(seed),
+        "bootstrap_samples": int(bootstrap_samples),
+        "timestamp_utc": datetime.utcnow().isoformat() + "Z",
+        "case_id_filter_path": case_id_filter_path,
         "per_benchmark": {},
         "groups": {},
     }
@@ -705,6 +865,9 @@ def generate_and_evaluate(
                     search_mode=search_mode,
                     beam_width=beam_width,
                     max_rounds=max_rounds,
+                    patch_strategies=patch_strategies,
+                    base_seed=seed,
+                    case_id=str(case.get("id", "")),
                 )
                 case_entry["best_patch"] = result.get("best_patch", "")
                 case_entry["reference_patch"] = case.get("reference_patch", "")
@@ -721,6 +884,7 @@ def generate_and_evaluate(
                     verifier_rounds=verifier_rounds,
                     search_mode=search_mode,
                     beam_width=beam_width,
+                    seed=_stable_seed(seed, "agentic", bench_name, str(case.get("id", ""))),
                 )
                 pass_value = 1.0 if bool(raw_result.get("all_passed", False)) else 0.0
                 history = raw_result.get("history", []) if isinstance(raw_result.get("history", []), list) else []
@@ -749,6 +913,8 @@ def generate_and_evaluate(
                     max_tokens=max_tokens,
                     timeout=timeout,
                     verifier_rounds=verifier_rounds,
+                    base_seed=seed,
+                    case_id=str(case.get("id", "")),
                 )
                 case_entry["result_code"] = result.get("best_code", "")
 
@@ -786,6 +952,9 @@ def generate_and_evaluate(
                         search_mode=search_mode,
                         beam_width=beam_width,
                         max_rounds=max_rounds,
+                        patch_strategies=patch_strategies,
+                        base_seed=seed,
+                        case_id=str(case.get("id", "")),
                     )
                     pred_patch = str(patch_result.get("best_patch", "") or "")
                     case_log["best_patch"] = pred_patch
@@ -893,6 +1062,7 @@ def generate_and_evaluate(
 
     contamination_set = {"livecodebench", "mbpp", "humaneval"}
     practical_set = {"bigcodebench_instruct", "swebench_verified_subset"}
+    private_set = {"private_holdout"}
 
     def _group_report(target_set):
         subset = [row for row in overall_records if row["benchmark"] in target_set]
@@ -910,10 +1080,13 @@ def generate_and_evaluate(
 
     contamination_report = _group_report(contamination_set)
     practical_report = _group_report(practical_set)
+    private_report = _group_report(private_set)
     if contamination_report:
         report["groups"]["contamination_safe_coding"] = contamination_report
     if practical_report:
         report["groups"]["practical_swe_agentic"] = practical_report
+    if private_report:
+        report["groups"]["private_holdout"] = private_report
 
     metric_k = n_candidates if use_agentic else pass_k
     print("\n" + "=" * 70)
@@ -955,6 +1128,11 @@ def generate_and_evaluate(
         print(f"- Pass@1: {_render_ci_percent(practical_report['pass_at_1_ci'])}")
         print(f"- Pass@{metric_k}: {_render_ci_percent(practical_report['pass_at_k_ci'])}")
         print(f"- Format Error Rate: {_render_ci_percent(practical_report['format_error_rate_ci'])}")
+    if private_report:
+        print("\nPrivate holdout summary:")
+        print(f"- Pass@1: {_render_ci_percent(private_report['pass_at_1_ci'])}")
+        print(f"- Pass@{metric_k}: {_render_ci_percent(private_report['pass_at_k_ci'])}")
+        print(f"- Format Error Rate: {_render_ci_percent(private_report['format_error_rate_ci'])}")
 
     print("=" * 70)
 
@@ -999,6 +1177,9 @@ if __name__ == "__main__":
     parser.add_argument("--swebench-dataset-name", default="princeton-nlp/SWE-bench_Verified")
     parser.add_argument("--swebench-split", default="test")
     parser.add_argument("--swebench-max-workers", type=int, default=4)
+    parser.add_argument("--private-holdout-path", default="")
+    parser.add_argument("--patch-strategies", default="minimal_diff,api_first,test_first")
+    parser.add_argument("--case-id-filter-path", default="")
     parser.add_argument(
         "--swebench-harness-cmd",
         default=(
@@ -1012,6 +1193,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--case-log-path", default="")
     parser.add_argument("--json-output", default="")
+    parser.add_argument("--seed", type=int, default=3407)
     args = parser.parse_args()
 
     generate_and_evaluate(
@@ -1035,7 +1217,11 @@ if __name__ == "__main__":
         swebench_dataset_name=args.swebench_dataset_name,
         swebench_split=args.swebench_split,
         swebench_max_workers=args.swebench_max_workers,
+        private_holdout_path=args.private_holdout_path,
+        patch_strategies=args.patch_strategies,
+        case_id_filter_path=args.case_id_filter_path,
         swebench_harness_cmd=args.swebench_harness_cmd,
         case_log_path=args.case_log_path,
         json_output=args.json_output,
+        seed=args.seed,
     )

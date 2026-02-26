@@ -46,6 +46,23 @@ def extract_xml_content(text: str, tag: str) -> str:
     return ""
 
 
+def _stable_seed(base_seed: int, *parts: str) -> int:
+    payload = "|".join([str(base_seed)] + [str(p) for p in parts])
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return int(digest[:8], 16)
+
+
+def _build_sampling_params(seed: int, **kwargs) -> SamplingParams:
+    # vLLM SamplingParams differs by version; seed is best-effort for determinism.
+    params = dict(kwargs)
+    params["seed"] = int(seed)
+    try:
+        return SamplingParams(**params)
+    except TypeError:
+        params.pop("seed", None)
+        return SamplingParams(**params)
+
+
 def _strip_code_fences(text: str) -> str:
     cleaned = text.replace("```python", "").replace("```py", "").replace("```", "")
     return cleaned.strip()
@@ -430,9 +447,10 @@ def _expand_beam_states(
     verifier_rounds: int,
     round_idx: int,
     candidate_budget: int,
+    base_seed: int = 3407,
 ) -> List[Dict[str, object]]:
     expanded: List[Dict[str, object]] = []
-    for state in states:
+    for state_idx, state in enumerate(states):
         prompt = str(state.get("prompt", "") or "")
         if not prompt:
             continue
@@ -440,7 +458,9 @@ def _expand_beam_states(
         context_prefix = str(state.get("context_prefix", "") or "")
         context_blocks = list(state.get("context_blocks", []))
 
-        sampling_params = SamplingParams(
+        sampling_seed = _stable_seed(base_seed, "beam", round_idx, state_idx, candidate_budget)
+        sampling_params = _build_sampling_params(
+            seed=sampling_seed,
             n=max(1, int(candidate_budget)),
             temperature=float(state.get("temperature", 0.3)),
             top_p=0.92,
@@ -486,6 +506,7 @@ def solve_with_tree_search(
     timeout: float = 2.0,
     temperature: float = 0.3,
     verifier_rounds: int = 2,
+    seed: int = 3407,
 ) -> Dict[str, object]:
     context_blocks = retrieve_repo_context(user_prompt, repo_root=repo_root)
     context_text = _render_context_blocks(context_blocks)
@@ -514,6 +535,7 @@ def solve_with_tree_search(
             verifier_rounds=verifier_rounds,
             round_idx=round_idx,
             candidate_budget=scheduled,
+            base_seed=seed,
         )
         if not expanded:
             break
@@ -648,6 +670,7 @@ def solve_with_self_debug(
     early_stop_patience: int = 2,
     search_mode: str = "greedy",
     beam_width: int = 2,
+    seed: int = 3407,
 ) -> Dict[str, object]:
     search_mode = (search_mode or "greedy").strip().lower()
     if search_mode in {"beam", "mcts"}:
@@ -664,6 +687,7 @@ def solve_with_self_debug(
             timeout=timeout,
             temperature=temperature,
             verifier_rounds=verifier_rounds,
+            seed=seed,
         )
 
     context_blocks = retrieve_repo_context(user_prompt, repo_root=repo_root)
@@ -683,7 +707,9 @@ def solve_with_self_debug(
         scheduled = schedule[min(round_idx - 1, len(schedule) - 1)]
         round_candidates = _budget_for_error(last_error_type, scheduled)
 
-        sampling_params = SamplingParams(
+        sampling_seed = _stable_seed(seed, "self_debug", round_idx, round_candidates, last_error_type)
+        sampling_params = _build_sampling_params(
+            seed=sampling_seed,
             n=round_candidates,
             temperature=current_temperature,
             top_p=0.92,
@@ -816,6 +842,7 @@ def run_single_task(
     early_stop_patience: int = 2,
     search_mode: str = "greedy",
     beam_width: int = 2,
+    seed: int = 3407,
 ) -> Dict[str, object]:
     llm = _build_llm(model_path=model_path, max_model_len=max_model_len)
     return solve_with_self_debug(
@@ -831,6 +858,7 @@ def run_single_task(
         early_stop_patience=early_stop_patience,
         search_mode=search_mode,
         beam_width=beam_width,
+        seed=seed,
     )
 
 
@@ -849,6 +877,7 @@ if __name__ == "__main__":
     parser.add_argument("--early-stop-patience", type=int, default=2)
     parser.add_argument("--search-mode", default="greedy", choices=["greedy", "beam", "mcts"])
     parser.add_argument("--beam-width", type=int, default=2)
+    parser.add_argument("--seed", type=int, default=3407)
     args = parser.parse_args()
 
     result = run_single_task(
@@ -865,5 +894,6 @@ if __name__ == "__main__":
         early_stop_patience=args.early_stop_patience,
         search_mode=args.search_mode,
         beam_width=args.beam_width,
+        seed=args.seed,
     )
     print(result)
