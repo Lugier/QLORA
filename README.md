@@ -5,6 +5,12 @@ This repository trains a compact coding model (1.5B) to become a strong software
 Base model:
 - `Qwen/Qwen2.5-Coder-1.5B-Instruct`
 
+License:
+- MIT ([LICENSE](/Users/lukas/Desktop/LLM+/sota_slm_pipeline/LICENSE))
+
+Naming note:
+- Despite the repository name `QLORA`, the default training path here is high-quality LoRA/Unsloth tuning (not strict 4-bit classical QLoRA throughout every stage).
+
 ## What This Project Does (Non-Technical)
 
 Think of this as a 13-step bootcamp for an AI coder:
@@ -120,6 +126,7 @@ sota_slm_pipeline/
 Notes:
 - Root-level `*.py` files are compatibility wrappers so old commands still work.
 - New canonical implementation lives under `pipeline/core` and `pipeline/stages`.
+- Contributors should treat `pipeline/stages/*` as canonical entrypoints.
 
 ---
 
@@ -155,6 +162,15 @@ export RUN_ID=run_20260226_a
 bash scripts/runpod_train_full.sh
 ```
 
+Tiny PRM control:
+```bash
+export USE_TINY_PRM=auto   # auto|1|0
+bash scripts/runpod_train_full.sh
+```
+- `auto`: train tiny PRM when possible, fallback to dense reward if not.
+- `1`: require tiny PRM.
+- `0`: skip tiny PRM (dense execution reward only).
+
 If the pod is interrupted, start a new pod with the same volume and run again with the same `RUN_ID`.
 Stage 0 baseline artifacts are reused, and training stages continue from checkpoints (`resume_from_checkpoint=auto`).
 
@@ -186,6 +202,7 @@ bash scripts/runpod_deploy_and_train.sh
 - Runs hard preflight checks (GPU, disk, CUDA, imports, trainer classes).
 - Starts full 13-stage training/evaluation/export pipeline.
 - Writes launcher logs to `run_manifests/<RUN_ID>/deploy_launcher.log`.
+- Writes `requirements.lock.txt` after setup for run-level reproducibility.
 
 5. Resume after spot interruption:
 ```bash

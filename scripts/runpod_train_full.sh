@@ -40,6 +40,9 @@ AGENT_BEAM_WIDTH="${AGENT_BEAM_WIDTH:-2}"
 PATCH_STRATEGIES="${PATCH_STRATEGIES:-minimal_diff,api_first,test_first,balanced}"
 HARD_MINING_CYCLES="${HARD_MINING_CYCLES:-2}"
 PRM_MODEL_PATH="${PRM_MODEL_PATH:-./artifacts/prm_tiny_v1.json}"
+USE_TINY_PRM="${USE_TINY_PRM:-auto}"
+REWARD_PROFILE="dense_exec_v1"
+PRM_ENABLED=0
 STRICT_SWEBENCH_HARNESS="${STRICT_SWEBENCH_HARNESS:-1}"
 
 if [[ "${STRICT_SWEBENCH_HARNESS}" == "1" ]] && [[ "${SWEBENCH_MODE}" != "harness" ]]; then
@@ -89,8 +92,12 @@ else
     echo "gpu_mem_mb=${GPU_MEM_MB}"
     echo "profile_sft_max_seq_len=${SFT_MAX_SEQ_LEN}"
     echo "profile_p1b_generation_batch_size=${P1B_GEN_BATCH}"
-    echo "profile_grpo_max_seq_len=${GRPO_MAX_SEQ_LEN}"
-    echo "python_version=$(python3 --version 2>&1)"
+  echo "profile_grpo_max_seq_len=${GRPO_MAX_SEQ_LEN}"
+  echo "use_tiny_prm=${USE_TINY_PRM}"
+  echo "unsloth_ref=${UNSLOTH_REF:-main}"
+  echo "unsloth_zoo_ref=${UNSLOTH_ZOO_REF:-main}"
+  echo "swebench_ref=${SWEBENCH_REF:-main}"
+  echo "python_version=$(python3 --version 2>&1)"
     echo "git_commit=$(git rev-parse HEAD 2>/dev/null || echo n/a)"
     echo "git_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo n/a)"
     python3 - <<'PY'
@@ -283,7 +290,7 @@ python3 phase2_grpo.py \
   --curriculum-mode two_dimensional_v1 \
   --priority-source-boost 1.8 \
   --priority-sources online_hard_mining,tool_trajectory_distill \
-  --reward-profile prm_outcome_v1 \
+  --reward-profile "${REWARD_PROFILE}" \
   --prm-model-path "${PRM_MODEL_PATH}" \
   --hard-replay-dataset ./sota_best_of_n_dataset \
   --hard-replay-steps 180 \
@@ -360,14 +367,53 @@ python3 scripts/build_tool_trajectories.py \
 [[ -d "sota_tool_trajectory_dataset" ]] || { echo "[train] Missing tool trajectory dataset."; exit 1; }
 
 echo "[train] Stage 9.5/13: train tiny PRM from real failures"
-python3 scripts/train_prm_tiny.py \
-  --case-log-paths "${MANIFEST_DIR}/pre_replay_eval_classic_cases.jsonl,${MANIFEST_DIR}/pre_replay_eval_agentic_cases.jsonl" \
-  --output-path "${PRM_MODEL_PATH}" \
-  --buckets 8192 \
-  --epochs 4 \
-  --learning-rate 0.08 \
-  --min-samples 120
-[[ -f "${PRM_MODEL_PATH}" ]] || { echo "[train] Missing trained PRM model artifact."; exit 1; }
+case "${USE_TINY_PRM}" in
+  1|true|TRUE|yes|YES|on|ON)
+    python3 scripts/train_prm_tiny.py \
+      --case-log-paths "${MANIFEST_DIR}/pre_replay_eval_classic_cases.jsonl,${MANIFEST_DIR}/pre_replay_eval_agentic_cases.jsonl" \
+      --output-path "${PRM_MODEL_PATH}" \
+      --buckets 8192 \
+      --epochs 4 \
+      --learning-rate 0.08 \
+      --min-samples 120
+    [[ -f "${PRM_MODEL_PATH}" ]] || { echo "[train] Missing trained PRM model artifact."; exit 1; }
+    REWARD_PROFILE="prm_outcome_v1"
+    PRM_ENABLED=1
+    ;;
+  0|false|FALSE|no|NO|off|OFF)
+    echo "[train] Tiny PRM disabled via USE_TINY_PRM=${USE_TINY_PRM}."
+    REWARD_PROFILE="dense_exec_v1"
+    PRM_ENABLED=0
+    ;;
+  auto|AUTO|Auto)
+    if python3 scripts/train_prm_tiny.py \
+      --case-log-paths "${MANIFEST_DIR}/pre_replay_eval_classic_cases.jsonl,${MANIFEST_DIR}/pre_replay_eval_agentic_cases.jsonl" \
+      --output-path "${PRM_MODEL_PATH}" \
+      --buckets 8192 \
+      --epochs 4 \
+      --learning-rate 0.08 \
+      --min-samples 120; then
+      if [[ -f "${PRM_MODEL_PATH}" ]]; then
+        REWARD_PROFILE="prm_outcome_v1"
+        PRM_ENABLED=1
+      else
+        echo "[train] WARN: Tiny PRM training reported success but artifact missing; falling back to dense_exec_v1."
+        REWARD_PROFILE="dense_exec_v1"
+        PRM_ENABLED=0
+      fi
+    else
+      echo "[train] WARN: Tiny PRM training failed in auto mode; falling back to dense_exec_v1."
+      REWARD_PROFILE="dense_exec_v1"
+      PRM_ENABLED=0
+    fi
+    ;;
+  *)
+    echo "[train] ERROR: Unsupported USE_TINY_PRM='${USE_TINY_PRM}'. Use one of: auto, 1, 0."
+    exit 1
+    ;;
+esac
+
+echo "[train] Reward profile selected: ${REWARD_PROFILE} (PRM_ENABLED=${PRM_ENABLED})"
 
 echo "[train] Stage 10/13: hard-replay GRPO pass"
 python3 phase2_grpo.py \
@@ -384,7 +430,7 @@ python3 phase2_grpo.py \
   --curriculum-mode two_dimensional_v1 \
   --priority-source-boost 1.6 \
   --priority-sources online_hard_mining,tool_trajectory_distill \
-  --reward-profile prm_outcome_v1 \
+  --reward-profile "${REWARD_PROFILE}" \
   --prm-model-path "${PRM_MODEL_PATH}" \
   --hard-replay-dataset ./sota_hard_examples_dataset \
   --hard-replay-steps 120 \
@@ -461,14 +507,18 @@ if [[ "${HARD_MINING_CYCLES}" =~ ^[0-9]+$ ]] && [[ "${HARD_MINING_CYCLES}" -gt 1
       --max-samples 3000
     [[ -d "${TRAJ_DS}" ]] || { echo "[train] Missing trajectory dataset for cycle ${CYCLE}."; exit 1; }
 
-    python3 scripts/train_prm_tiny.py \
-      --case-log-paths "${CLASSIC_CASE_LOG},${AGENTIC_CASE_LOG}" \
-      --output-path "${PRM_PATH_CYCLE}" \
-      --buckets 8192 \
-      --epochs 3 \
-      --learning-rate 0.08 \
-      --min-samples 80
-    [[ -f "${PRM_PATH_CYCLE}" ]] || { echo "[train] Missing PRM model for cycle ${CYCLE}."; exit 1; }
+    if [[ "${PRM_ENABLED}" -eq 1 ]]; then
+      python3 scripts/train_prm_tiny.py \
+        --case-log-paths "${CLASSIC_CASE_LOG},${AGENTIC_CASE_LOG}" \
+        --output-path "${PRM_PATH_CYCLE}" \
+        --buckets 8192 \
+        --epochs 3 \
+        --learning-rate 0.08 \
+        --min-samples 80
+      [[ -f "${PRM_PATH_CYCLE}" ]] || { echo "[train] Missing PRM model for cycle ${CYCLE}."; exit 1; }
+    else
+      PRM_PATH_CYCLE=""
+    fi
 
     python3 phase2_grpo.py \
       --max-seq-length "${GRPO_MAX_SEQ_LEN}" \
@@ -484,7 +534,7 @@ if [[ "${HARD_MINING_CYCLES}" =~ ^[0-9]+$ ]] && [[ "${HARD_MINING_CYCLES}" -gt 1
       --curriculum-mode two_dimensional_v1 \
       --priority-source-boost 1.8 \
       --priority-sources online_hard_mining,tool_trajectory_distill \
-      --reward-profile prm_outcome_v1 \
+      --reward-profile "${REWARD_PROFILE}" \
       --prm-model-path "${PRM_PATH_CYCLE}" \
       --hard-replay-dataset "${HARD_DS}" \
       --hard-replay-steps 100 \

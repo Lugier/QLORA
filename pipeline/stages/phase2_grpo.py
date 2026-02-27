@@ -95,6 +95,18 @@ def _latest_checkpoint(output_dir):
     return candidates[0][1]
 
 
+def _checkpoint_step(path: str) -> int:
+    if not path:
+        return 0
+    name = os.path.basename(str(path).rstrip("/"))
+    if not name.startswith("checkpoint-"):
+        return 0
+    try:
+        return max(0, int(name.split("checkpoint-")[-1]))
+    except ValueError:
+        return 0
+
+
 def _extract_split(dataset):
     if isinstance(dataset, DatasetDict):
         if "train" in dataset:
@@ -766,6 +778,11 @@ def train_grpo(
                 stage_resume = resume_from_checkpoint
         if stage_resume:
             print(f"[Curriculum] Resuming stage '{stage_name}' from {stage_resume}")
+        rewards_module.AERO_MAX_STEPS = max(1, int(stage_steps))
+        rewards_module.AERO_GLOBAL_STEP = min(
+            rewards_module.AERO_MAX_STEPS,
+            _checkpoint_step(stage_resume) if stage_resume else 0,
+        )
         trainer.train(resume_from_checkpoint=stage_resume)
 
     replay_dataset = _load_hard_replay_dataset(
@@ -811,6 +828,11 @@ def train_grpo(
                 replay_resume = resume_from_checkpoint
         if replay_resume:
             print(f"[Replay] Resuming hard replay from {replay_resume}")
+        rewards_module.AERO_MAX_STEPS = max(1, int(replay_steps))
+        rewards_module.AERO_GLOBAL_STEP = min(
+            rewards_module.AERO_MAX_STEPS,
+            _checkpoint_step(replay_resume) if replay_resume else 0,
+        )
         replay_trainer.train(resume_from_checkpoint=replay_resume)
 
     print("GRPO Alignment successfully executed.")

@@ -5,3 +5,5 @@ outputs_*/
 qwen_*/
 sota_*_dataset/
 model_export_*/
+run_manifests/
+requirements.lock.txt

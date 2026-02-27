@@ -4,6 +4,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
+UNSLOTH_ZOO_REF="${UNSLOTH_ZOO_REF:-main}"
+UNSLOTH_REF="${UNSLOTH_REF:-main}"
+SWEBENCH_REF="${SWEBENCH_REF:-main}"
+
 echo "[setup] Upgrading pip toolchain..."
 python3 -m pip install --upgrade pip setuptools wheel
 
@@ -34,12 +38,12 @@ python3 -m pip install --index-url https://download.pytorch.org/whl/cu121 \
   torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0
 
 echo "[setup] Installing Unsloth + Unsloth Zoo (CUDA 12.1 / Torch 2.4 profile)..."
-python3 -m pip install --no-deps git+https://github.com/unslothai/unsloth-zoo.git
+python3 -m pip install --no-deps "git+https://github.com/unslothai/unsloth-zoo.git@${UNSLOTH_ZOO_REF}"
 if ! python3 -m pip install --no-build-isolation \
-  "unsloth[cu121-torch240] @ git+https://github.com/unslothai/unsloth.git"; then
+  "unsloth[cu121-torch240] @ git+https://github.com/unslothai/unsloth.git@${UNSLOTH_REF}"; then
   echo "[setup] Falling back to Ampere profile for Unsloth extras..."
   python3 -m pip install --no-build-isolation \
-    "unsloth[cu121-ampere-torch240] @ git+https://github.com/unslothai/unsloth.git"
+    "unsloth[cu121-ampere-torch240] @ git+https://github.com/unslothai/unsloth.git@${UNSLOTH_REF}"
 fi
 
 echo "[setup] Installing project dependencies..."
@@ -48,7 +52,7 @@ python3 -m pip install -r requirements.txt
 echo "[setup] Installing SWE-bench harness tooling..."
 if ! python3 -m pip install swebench; then
   echo "[setup] WARN: pip install swebench failed, trying GitHub source..."
-  python3 -m pip install git+https://github.com/SWE-bench/SWE-bench.git
+  python3 -m pip install "git+https://github.com/SWE-bench/SWE-bench.git@${SWEBENCH_REF}"
 fi
 
 echo "[setup] Recommended runtime env for RTX 3090 / 24GB stability:"
@@ -91,6 +95,9 @@ print("[setup] Import and CUDA checks passed.")
 print(f"[setup] Torch version: {torch.__version__}")
 print(f"[setup] CUDA device: {torch.cuda.get_device_name(0)}")
 PY
+
+echo "[setup] Writing reproducibility lockfile (requirements.lock.txt)..."
+python3 -m pip freeze | LC_ALL=C sort > requirements.lock.txt
 
 echo "[setup] RunPod environment setup complete."
 if [[ -x "scripts/runpod_preflight.sh" ]]; then
