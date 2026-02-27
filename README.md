@@ -127,6 +127,7 @@ Notes:
 - Root-level `*.py` files are compatibility wrappers so old commands still work.
 - New canonical implementation lives under `pipeline/core` and `pipeline/stages`.
 - Contributors should treat `pipeline/stages/*` as canonical entrypoints.
+- There is no second nested source tree anymore (old duplicate snapshot removed).
 
 ---
 
