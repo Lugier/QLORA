@@ -1,263 +1,110 @@
-# QLORA Coding Model Pipeline (RunPod Ready)
+<div align="center">
+  <h1>🧬 QLORA: My First SLM Fine-Tuning Journey & Scientific Report</h1>
+  <p><i>From a raw 1.5B parameter generative model to a structured, reasoning AI Agent.</i></p>
+</div>
 
-This repository trains a compact coding model (1.5B) to become a strong software-engineering assistant.
+Welcome to my **very first attempt** at fine-tuning a Small Language Model (SLM)! This repository documents my journey of taking a foundational 1.5B parameter coding model and subjecting it to a state-of-the-art multi-stage Reinforcement Learning (RL) pipeline. 
 
-Base model:
-- `Qwen/Qwen2.5-Coder-1.5B-Instruct`
-
-License:
-- MIT ([LICENSE](/Users/lukas/Desktop/LLM+/sota_slm_pipeline/LICENSE))
-
-Naming note:
-- Despite the repository name `QLORA`, the default training path here is high-quality LoRA/Unsloth tuning (not strict 4-bit classical QLoRA throughout every stage).
-
-## What This Project Does (Non-Technical)
-
-Think of this as a 13-step bootcamp for an AI coder:
-
-1. We test the raw model first (baseline).
-2. We prepare high-quality training data.
-3. We teach formatting and coding fundamentals.
-4. We teach preference between better/worse answers.
-5. We strengthen behavior with reinforcement learning.
-6. We repeatedly test, collect failures, and retrain on hard cases.
-7. We only accept the run if strict quality/statistics gates pass.
-
-Goal:
-- Better real coding performance
-- Better repo bug-fixing behavior
-- Lower format mistakes
-- Reproducible, auditable training runs
+Spoiler alert: It wasn't just a simple `.train()` call. It failed in fascinating ways, taught me crucial lessons about AI behavior, and ultimately yielded an optimized model capable of advanced reasoning and real-world repository bug-fixing.
 
 ---
 
-## Evaluation Results & Scientific Findings
+## 📊 The Final Verdict: Was it a success?
 
-We evaluated the baseline `Qwen2.5-Coder-1.5B-Instruct` against our GRPO-finetuned model (`qwen_grpo_final`) across standard python benchmarks (HumanEval, MBPP), custom hard algorithmic problems, and real-world SWE-Bench patches. This end-to-end RL pipeline revealed **five critical scientific insights** into SLM performance:
+Yes and no. The pipeline successfully ran end-to-end, and the model learned to "think" out loud using `<reasoning>` tags. However, I discovered that Reinforcement Learning is a double-edged sword for small models. 
+
+| Benchmark | Baseline (Qwen 1.5B) | Finetuned (GRPO Final) | Difference |
+| :--- | :---: | :---: | :--- |
+| **HumanEval** (Pass@K) | 69.0% | **81.0%** | 🟢 **+12.0%** (Massive improvement in logic extraction) |
+| **SWE-Bench** (Proxy Score) | 0.0%* | **34.8%** | 🟢 SLM successfully locates bugs in complex repos |
+| **Custom 50 Hard** (Pass@1) | **90.0%** | 86.0% | 🔴 **-4.0%** (The "Thinking-Tax" penalty) |
+| **MBPP** (Agentic Pass@4)| 20.0% | 20.0% | 🟡 **Stagnant** (Limits of SLM self-correction) |
+
+*\*Baseline not evaluated on SWE-Bench due to output format incompatibility.*
+
+---
+
+## 🔬 Scientific Findings & Why Things "Failed"
+
+This project was a massive learning curve. Here is exactly what failed, why it failed, and what scientists and engineers can learn from it:
 
 ### 1. The "Thinking-Tax" (Zero-Shot vs. Multi-Shot Reasoning)
-GRPO RL enforces long `<reasoning>` chains before generating code. On heavily memorized standard algorithmic problems (Custom 50 Hard), the finetuned model saw a slight dip in immediate Zero-Shot precision (Pass@1 dropped from 90% to 86%), as the model sometimes "over-engineers" simple problems in its reasoning step. However, on more complex logic tasks like HumanEval, this forced reasoning mechanism increased the Pass@K score significantly from **69% to 81%**. RL trades absolute first-shot precision for stable, iterative problem-solving capabilities.
+* **The Expectation:** RL using GRPO would make the model strictly smarter at everything.
+* **The Reality:** On heavily memorized standard algorithmic problems (my `Custom 50 Hard` set), the finetuned model saw a slight dip in immediate Zero-Shot precision (Pass@1 dropped from 90% to 86%). 
+* **Why it failed:** GRPO enforces long `<reasoning>` chains. The model over-engineered simple problems in its reasoning step, essentially "talking itself" into a misunderstood approach. However, on complex logic tasks (HumanEval), this forced reasoning increased the Pass@K score from 69% to 81%. 
+* **Takeaway:** RL trades absolute first-shot memorization precision for stable, iterative, and deep problem-solving capabilities.
 
 ### 2. The Limits of SLM Agentic Self-Correction
-During the Phase 8 Agentic Evaluation on MBPP, the model was allowed to read execution errors from the python sandbox and self-correct up to 3 times. The Pass@1 and Pass@4 scores remained stagnant at **20%**. A 1.5B parameter model can fix syntax typos (like tweaking `>` to `>=`), but often lacks the architectural macro-perspective to entirely rewrite a flawed algorithm from scratch after failing. This proves the necessity of Process Reward Models (PRMs) to provide step-by-step guidance rather than just outcome-based execution errors.
+* **The Expectation:** If the model gets an execution error from a Python sandbox, it will read the error and rewrite the code perfectly.
+* **The Reality:** During Phase 8 Agentic Eval on MBPP, the model was allowed to self-correct up to 3 times. The Pass@1 and Pass@4 scores remained absolutely stagnant at 20%.
+* **Why it failed:** A 1.5B parameter model acts like a Junior Developer. It can fix a syntax typo (changing `>` to `>=`), but it completely lacks the architectural macro-perspective to delete a flawed algorithm and rewrite it from scratch. 
+* **Takeaway:** SLMs hit a hard "Self-Correction" ceiling. To break this, you need Process Reward Models (PRMs) providing step-by-step logic guidance, rather than just outcome-based execution errors.
 
-### 3. SWE-Bench: SLMs as Effective "Scout Agents"
-On real-world GitHub issues (SWE-Bench Verified), the 1.5B model achieved a **3% perfect patch rate** and an impressive **34.8% proxy score** (successfully locating the correct file and function to edit). This proves that massive 80B+ models are not required for repository navigation. A 1.5B SLM is a highly cost-effective "Scout Agent", efficiently scanning repositories to locate bugs before handing the complex patch-writing off to larger models.
+### 3. Data Contamination & Role-Playing Strictness
+* **The Expectation:** The model obeys the system prompt to output Python inside `<answer>` tags.
+* **The Reality:** During evaluation on my private holdout set (competitive programming questions), the baseline model had a **75% format error rate**. It immediately reverted to generating C++ routines with `cin` and `cout`, ignoring the XML tags entirely.
+* **Why it failed:** Models inherently default back to their pre-training distributions (Codeforces C++ templates) when the prompt context smells like a competitive programming contest. 
+* **Takeaway:** You need heavy negative RL penalization (format rewards) to enforce strict role-playing compliance and break the model out of its pre-training habits.
 
-### 4. Data Contamination & Role-Playing Strictness
-During evaluation on a private holdout set containing competitive programming questions, the baseline model exhibited a 75% format error rate, immediately reverting to generating C++ routines with `cin` and `cout` and dropping the required `<reasoning>` XML tags. This highlights that models inherently default back to their pre-training distributions (Codeforces C++ templates) when the prompt context resembles a competitive programming task. Heavy negative RL penalization is required to enforce strict role-playing compliance.
-
-### 5. Architectural Stability (No Catastrophic Forgetting)
-Despite the intense reasoning and SWE-Bench formatting forced by the multi-stage RL pipeline, the model preserved its core algorithmic capabilities. On 50 entirely new, hard algorithmic challenges (spanning DP, Graph Theory, and Bit Manipulation), the model retained a **94% Pass@4 score**, identical to the baseline. This confirms that the SFT -> DPO -> GRPO curriculum successfully shifted the model's behavior without suffering from catastrophic forgetting.
-
----
-
-## End-to-End Flow (What Happens, When, and Why)
-
-### Stage 0: Baseline Freeze
-- What: Evaluate the start model and save environment + run manifest.
-- Why: We need a trustworthy before/after comparison.
-
-### Stage 1: Data Pipeline
-- What: Build curated datasets, deduplicate, split into train/validation/holdout.
-- Why: Data quality drives model quality.
-
-### Stage 2: SFT (Supervised Fine-Tuning)
-- What: Teach clean structure and coding behavior on curated examples.
-- Why: Gives stable foundation before preference/RL stages.
-
-### Stage 3: Best-of-N + Pair Mining
-- What: Generate many candidates and keep high-quality outcomes + preference pairs.
-- Why: Converts raw generation into stronger training signals.
-
-### Stage 4: DPO
-- What: Train on chosen vs rejected responses.
-- Why: Better alignment with preferred coding style/outcomes.
-
-### Stage 5: ORPO
-- What: Additional preference optimization stage.
-- Why: Stabilizes policy before RL.
-
-### Stage 6: GRPO (Reinforcement Learning)
-- What: Curriculum RL using execution rewards, process rewards, and penalties.
-- Why: Improves real solve-rate under tests and constraints.
-
-### Stage 7-8: Pre-Replay Evaluation
-- What: Run benchmark evaluations and collect detailed case logs.
-- Why: Identify concrete weaknesses before replay training.
-
-### Stage 9: Hard Example + Trajectory Mining
-- What: Build hard replay dataset and tool-use trajectory dataset from failures.
-- Why: Train directly on what the model currently gets wrong.
-
-### Stage 9.5: Tiny PRM Training
-- What: Train a compact process-reward helper model from real logs.
-- Why: Better process-level reward shaping.
-
-### Stage 10: Hard Replay RL
-- What: Short focused RL pass on hardest cases.
-- Why: Push performance on difficult SWE patterns.
-
-### Stage 11-12: Final Evaluation + Export
-- What: Final benchmark run and model export.
-- Why: Produce deployable artifacts with validated quality.
-
-### Stage 13: Scientific Acceptance Gate
-- What: CI/statistical checks, no-regression checks, and quality thresholds.
-- Why: Prevent false wins and ensure robust improvements.
+### 4. SWE-Bench: SLMs as Effective "Scout Agents"
+* **The Reality:** On real-world GitHub issues (SWE-Bench Verified), the 1.5B model achieved a **3% perfect patch rate** and an impressive **34.8% proxy score** (successfully locating the correct file and function to edit). 
+* **Takeaway:** Massive 80B+ models are not required for repository navigation! A 1.5B SLM is a highly cost-effective "Scout Agent", efficiently scanning repositories to locate bugs before handing the complex patch-writing off to larger, more expensive models.
 
 ---
 
-## Repository Structure
+## 🏗️ The 13-Step SOTA Pipeline
+
+Here is the exact pipeline I built to achieve these results (fully reproducible via RunPod):
+
+### Phase 1: Foundation & Alignment
+* **Stage 0: Baseline Freeze** - Evaluate the start model and save environments to ensure a trustworthy before/after comparison.
+* **Stage 1: Data Pipeline** - Build curated datasets, deduplicate, and split into train/validation/holdout.
+* **Stage 2: SFT (Supervised Fine-Tuning)** - Teach clean structure (`<reasoning>` and `<answer>` tags) on curated examples.
+* **Stage 3 & 4: Rejection Sampling & DPO** - Generate many candidates, score them, and train the model on chosen vs. rejected responses to align coding style.
+* **Stage 5: ORPO** - Additional preference optimization to stabilize the policy before the volatile RL stage.
+
+### Phase 2: Reinforcement Learning & Agentic Growth
+* **Stage 6: GRPO (Reinforcement Learning)** - Curriculum RL using execution rewards (sandbox tests), process rewards, and strict formatting penalties.
+* **Stage 7 & 8: Pre-Replay Evaluation** - Run benchmark evaluations (Classic & Agentic) and collect detailed case logs to identify concrete weaknesses.
+
+### Phase 3: Targeted Hard-Mining
+* **Stage 9: Hard Example Mining** - Extract the exact failures from Stage 7 & 8 to build a dynamic "Hard Replay" dataset.
+* **Stage 9.5: Tiny PRM Training** - Train a compact process-reward helper model from real logs.
+* **Stage 10: Hard Replay RL** - A short, focused aggressive RL pass exclusively on the hardest cases identified.
+
+### Phase 4: Validation
+* **Stage 11-13: Final Evaluation, Export & Scientific Gate** - Final benchmark run, model export to HuggingFace/GGUF, and strict CI/statistical checks to prevent false positive wins.
+
+---
+
+## 💻 Repository Structure & Usage
 
 ```text
 sota_slm_pipeline/
 ├── pipeline/
-│   ├── core/                      # Shared runtime/reward/verification logic
-│   │   ├── rewards.py
-│   │   ├── verification.py
-│   │   ├── runtime_agent.py
-│   │   ├── sandbox.py
-│   │   └── prm_tiny.py
-│   ├── stages/                    # Main training/eval stage implementations
-│   │   ├── data_pipeline.py
-│   │   ├── phase1_sft.py
-│   │   ├── phase1b_rejection_sampling.py
-│   │   ├── phase1c_dpo.py
-│   │   ├── phase1d_orpo.py
-│   │   ├── phase2_grpo.py
-│   │   ├── eval_pipeline.py
-│   │   └── export.py
-│   ├── docs/
-│   └── config/
+│   ├── core/                      # Shared runtime/reward/sandbox logic
+│   └── stages/                    # Main training/eval stage implementations
 ├── scripts/                       # RunPod orchestration + utilities
-│   ├── runpod_setup.sh
-│   ├── runpod_train_full.sh
-│   ├── build_hard_examples.py
-│   ├── build_tool_trajectories.py
-│   ├── train_prm_tiny.py
-│   ├── scientific_gate.py
-│   └── validate_cli_drift.py
+│   ├── runpod_deploy_and_train.sh # 🚀 ONE-CLICK LAUNCHER
+│   └── runpod_train_full.sh       # Full 13-stage execution
 ├── tests/                         # Unit/regression tests
 ├── docs/
-│   └── SCIENTIFIC_PROTOCOL.md
-└── *.py                           # Backward-compatible wrappers (legacy entrypoints)
+│   └── SCIENTIFIC_PROTOCOL.md     # Statistical rigor documentation
+├── create_50_hard.py              # Custom 50-Algorithm Dataset generator
+└── README.md
 ```
 
-Notes:
-- Root-level `*.py` files are compatibility wrappers so old commands still work.
-- New canonical implementation lives under `pipeline/core` and `pipeline/stages`.
-- Contributors should treat `pipeline/stages/*` as canonical entrypoints.
-- There is no second nested source tree anymore (old duplicate snapshot removed).
+### Quick Start (Launch on RunPod)
 
----
-
-## Quick Start (RunPod)
-
+1. **Create the pod**: `RTX 3090` (24GB) or stronger.
+2. **Clone & Run**:
 ```bash
-cd /workspace/sota_slm_pipeline
-bash scripts/runpod_setup.sh
-bash scripts/runpod_preflight.sh
-bash scripts/runpod_train_full.sh
-```
-
-Optional:
-```bash
-export HF_TOKEN=hf_xxx
-```
-
-One-command launcher:
-```bash
-bash scripts/runpod_deploy_and_train.sh
-```
-
-Local prepare + smoke:
-```bash
-export RUN_ID=local_smoke_01
-bash scripts/local_prepare_and_smoke.sh
-```
-- This runs static checks, CLI drift, unit tests, and automatically runs a mini baseline benchmark if local hardware/runtime is sufficient.
-
-Spot-resume best practice:
-```bash
-export RUN_ID=run_20260226_a
-bash scripts/runpod_train_full.sh
-```
-
-Tiny PRM control:
-```bash
-export USE_TINY_PRM=auto   # auto|1|0
-bash scripts/runpod_train_full.sh
-```
-- `auto`: train tiny PRM when possible, fallback to dense reward if not.
-- `1`: require tiny PRM.
-- `0`: skip tiny PRM (dense execution reward only).
-
-If the pod is interrupted, start a new pod with the same volume and run again with the same `RUN_ID`.
-Stage 0 baseline artifacts are reused, and training stages continue from checkpoints (`resume_from_checkpoint=auto`).
-
-## RunPod Step-by-Step (Detailed)
-
-1. Create the pod in RunPod:
-- GPU: `RTX 3090` (24GB) or stronger.
-- Use a PyTorch/CUDA image with Python 3.10 support.
-- Attach a persistent volume (important for spot resume).
-- Open the pod terminal.
-
-2. Clone and enter the project:
-```bash
-cd /workspace
 git clone https://github.com/Lugier/QLORA.git
 cd QLORA
-```
-
-3. Start full deploy + train in one command:
-```bash
-export HF_TOKEN=hf_xxx   # optional if private/gated model pulls are needed
-export RUN_ID=run_20260226_a
+export RUN_ID=my_first_slm_run
 bash scripts/runpod_deploy_and_train.sh
 ```
-
-4. What this command does automatically:
-- Pulls/updates the repo (if needed).
-- Installs dependencies (`torch`, `unsloth`, `trl`, `vllm`, `swebench`).
-- Runs hard preflight checks (GPU, disk, CUDA, imports, trainer classes).
-- Starts full 13-stage training/evaluation/export pipeline.
-- Writes launcher logs to `run_manifests/<RUN_ID>/deploy_launcher.log`.
-- Writes `requirements.lock.txt` after setup for run-level reproducibility.
-
-5. Resume after spot interruption:
-```bash
-cd /workspace/QLORA
-export RUN_ID=run_20260226_a
-bash scripts/runpod_deploy_and_train.sh
-```
-- Keep the same volume and the same `RUN_ID`.
-- Existing manifests/checkpoints are reused.
-
-6. Where to check outputs:
-- Manifests/reports: `run_manifests/<RUN_ID>/`
-- Final exported models: `model_export_hf/`, `model_export_gguf/`
+This single command installs dependencies, runs preflight checks, and executes the entire 13-stage training/evaluation pipeline automatically. Check the `run_manifests/<RUN_ID>/` folder for your scientific reports!
 
 ---
-
-## What “Success” Means
-
-The run is accepted only if strict gates pass, including:
-- low format error rate
-- significant improvement over baseline
-- no major benchmark regressions
-- complete artifacts + manifests
-
-Scientific details:
-- see `docs/SCIENTIFIC_PROTOCOL.md`
-
----
-
-## For External Readers
-
-If you are new:
-1. Read this README first.
-2. Read `docs/SCIENTIFIC_PROTOCOL.md` for evaluation rigor.
-3. Run `scripts/runpod_train_full.sh` for the full pipeline.
-4. Inspect `run_manifests/<timestamp>/` for reports and audit trail.
+> **License:** MIT | **Base Model:** `Qwen/Qwen2.5-Coder-1.5B-Instruct`
